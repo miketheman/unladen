@@ -1,0 +1,20 @@
+# EditorConfig is awesome: https://editorconfig.org
+
+# top-most EditorConfig file
+root = true
+
+# Unix-style newlines with a newline ending every file
+[*]
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[LICENSE]
+# These files are either templated or auto-generated, so we don't want to
+# enforce any particular indentation style
+indent_size = unset
+
+[*.{md}]
+indent_size = 2
