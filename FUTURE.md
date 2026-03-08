@@ -1,0 +1,107 @@
+# Future Work
+
+Ideas, deferred features, and improvements
+that are worth revisiting but not urgent.
+
+## Configuration
+
+### Configurable thresholds
+
+The heft recommendation thresholds (Keep >25%, Review >5%, etc.)
+and the mass threshold (500 LLOC) are hard-coded in `reporter.py`.
+Allow overriding via `[tool.unladen]` in `pyproject.toml` or CLI flags.
+
+## Analysis accuracy
+
+### Platform-conditional dependencies
+
+Dependencies declared with environment markers
+(e.g. `colorama; sys_platform == 'win32'`)
+show as "not installed" on non-matching platforms.
+The import may also live inside a platform guard
+(`if sys.platform == 'win32': import colorama`).
+Options:
+
+- Preserve the marker through the collector pipeline
+  and display "conditional (win32)" instead of "not installed."
+- Detect `sys.platform` / `os.name` guards in the inspector
+  and annotate those imports as platform-specific.
+
+### Dynamic dispatch: further improvements
+
+Registry dicts (`_languages[key]()`) and subscript calls
+are now traced.
+Remaining blind spots:
+
+- `getattr(obj, name)()` — dynamic attribute access.
+- `__init_subclass__` hooks — implicit class registration.
+- Plugin entry points (`[project.entry-points]`) —
+  could parse pyproject.toml to discover which dependency code
+  is activated at runtime.
+- Alias indirection: `f = registry[key]; f()` —
+  the call goes through a local variable,
+  not a direct subscript call.
+
+### Call graph: aliasing and indirection
+
+The current hand-rolled call graph
+is name-based and does not track aliasing
+(`f = some_module.func; f()`).
+Research from PyCG (assignment-graph approach, ICSE 2021)
+and Pyan3 (lexical scoping) could improve precision.
+Revisit when false negatives become a pain point.
+
+### `if TYPE_CHECKING` re-exports
+
+Some libraries re-export types from dependencies
+inside `if TYPE_CHECKING:` blocks.
+These are currently invisible to the inspector.
+Detecting this pattern could improve
+heft accuracy for typing-heavy projects.
+
+## CLI and UX
+
+### `--include-tests` flag
+
+`find_project_source()` excludes `tests/` by default.
+A flag to include test files would let users measure
+how much of a dependency their test suite exercises
+vs. their production code.
+
+### Diff mode
+
+Compare heft reports across two commits or branches
+to show how dependency usage changed.
+Useful for PR review ("this change increases heft of X by 5%").
+Currently can be manually done by running `unladen check --output=json`
+and comparing reports, but a built-in diff mode would be more convenient.
+
+### Richer "not installed" reporting
+
+When a dependency is declared but not installed,
+distinguish between "genuinely missing"
+and "conditional on another platform"
+(has environment markers like `sys_platform == 'win32'`).
+Currently both show the same "not installed" row.
+This might be the same as the platform-conditional dependencies improvement
+in the analysis section,
+
+## Packaging and distribution
+
+### `packaging` library for name normalization
+
+`_normalize_dep_name()` uses a hand-rolled regex
+for PEP 503 normalization.
+The `packaging` library's `canonicalize_name()`
+and `Requirement` parser are more correct
+for edge cases (URL requirements, nested extras).
+Revisit when the regex becomes a maintenance burden.
+This dependency is pretty stable overall,
+but would need to decide if the added dependency is worth the heft.
+
+### Caching
+
+Dependency indexing (Phase 3) is the most expensive step.
+A persistent cache keyed on
+`(dep_name, version, file content hashes)` could skip re-indexing
+unchanged dependencies across runs.
