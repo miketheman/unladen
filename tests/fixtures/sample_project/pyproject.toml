@@ -1,0 +1,7 @@
+[project]
+name = "myapp"
+version = "1.0.0"
+dependencies = [
+    "requests>=2.28",
+    "click>=8.0",
+]
