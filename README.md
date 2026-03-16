@@ -1,5 +1,11 @@
 # 🥥 unladen
 
+[![PyPI version](https://img.shields.io/pypi/v/unladen)](https://pypi.org/project/unladen/)
+[![Python versions](https://img.shields.io/pypi/pyversions/unladen)](https://pypi.org/project/unladen/)
+[![License](https://img.shields.io/pypi/l/unladen)](https://github.com/miketheman/unladen/blob/main/LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/miketheman/unladen/ci.yml?branch=main&label=CI)](https://github.com/miketheman/unladen/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/pypi/dm/unladen)](https://pypi.org/project/unladen/)
+
 > [!WARNING]
 > This project is in **early alpha**.
 > Results are approximate and should be treated as starting points for investigation,
