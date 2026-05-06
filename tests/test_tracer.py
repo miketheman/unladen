@@ -1205,7 +1205,7 @@ class TestNamesInValueNone:
         node = ast.parse("{a: None, b: MyClass}", mode="eval").body
         assert isinstance(node, ast.Dict)
         # Replace one value with None to simulate dict unpacking (**x produces None)
-        node.values[0] = None  # type: ignore[assignment]
+        node.values[0] = None  # ty: ignore[invalid-assignment]
         result = _names_in_value(node)
         # Only the non-None value (MyClass) should be collected
         assert "MyClass" in result
