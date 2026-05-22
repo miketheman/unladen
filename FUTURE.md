@@ -51,6 +51,34 @@ Research from PyCG (assignment-graph approach, ICSE 2021)
 and Pyan3 (lexical scoping) could improve precision.
 Revisit when false negatives become a pain point.
 
+### Bound-method alias tracking
+
+`unladen` resolves the module-level `alias = obj.method` pattern
+where `obj = ClassName()` or `obj = module.ClassName()`
+(added in [#25](https://github.com/miketheman/unladen/issues/25)
+for the pyjwt `decode = _jwt_global_obj.decode` case).
+A review surfaced gaps that are real but not yet observed in the wild:
+
+- Factory functions — `obj = make_session(); get = obj.get`.
+  Resolving this needs return-type inference
+  to know what `make_session()` constructs.
+  The edge is currently recorded against a non-existent
+  `make_session.get` and dead-ends harmlessly.
+- Guarded or chained instantiation —
+  `obj` created inside a `try:`/`if` block,
+  or via chained assignment (`a = b = ClassName()`).
+  Instance tracking only inspects module-top-level assignments.
+- Intermediate aliases — `b = a; c = b.method`.
+  This is the general name-aliasing case noted above.
+- Inherited methods — `obj = Sub(); alias = obj.method`
+  where `method` is defined on a base class.
+  The edge resolves to `Sub.method`, which is not indexed;
+  `_resolve_callee` would need to walk the base chain.
+- `TYPE_CHECKING` else-bodies —
+  an instance and its alias split across the
+  `if TYPE_CHECKING:`/`else:` boundary are not connected,
+  since the else-body is analyzed by a separate recursive pass.
+
 ### `if TYPE_CHECKING` re-exports
 
 Some libraries re-export types from dependencies
