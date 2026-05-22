@@ -42,6 +42,14 @@ run *ARGS:
 # Run all checks (lint, typecheck, test)
 check: lint typecheck test
 
+# Start the next dev cycle after a release (e.g. 0.1.0 -> 0.2.0.dev1)
+bump-dev SEGMENT="minor":
+    uv version --bump {{SEGMENT}} --bump dev
+
+# Drop the dev marker to cut a release (e.g. 0.2.0.dev1 -> 0.2.0)
+release-version:
+    uv version --bump stable
+
 # Clean build artifacts and caches
 clean:
     rm -rf build/ dist/ htmlcov/ .coverage .pytest_cache .ruff_cache

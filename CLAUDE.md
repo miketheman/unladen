@@ -6,15 +6,11 @@
 via static analysis.
 Python 3.14+, `uv` with src layout, single runtime dependency (`rich`).
 
-## Quick Reference
+## Development
 
-```bash
-just test           # run tests
-just cov            # tests with coverage
-just lint           # ruff check + format check
-just fmt            # auto-format
-just run check /path/to/project  # run the tool
-```
+Setup, `just` recipes, and the contribution workflow live in
+[`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
+Run `just` to list all recipes.
 
 ## Architecture
 
@@ -135,8 +131,8 @@ Exclusions are applied after dependency collection but before inspection.
 When deps are excluded, a footnote appears on the check table,
 the treemap title, and the show command header.
 
-Config is loaded via `load_config()` in `cli.py`.
-The normalized exclude set is built by `_load_exclude_set()`,
+Config is loaded via `load_config()` in `_config.py`.
+The normalized exclude set is built by `load_exclude_set()`,
 which reuses `_normalize_dep_name()` from `collector.py`.
 
 ## Style

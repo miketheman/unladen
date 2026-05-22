@@ -264,6 +264,14 @@ or shell invocations anywhere in the codebase.
   could hit Python's recursion limit and crash the tool.
   This cannot cause data loss or code execution.
 
+## Contributing
+
+Contributions are welcome.
+Please [open an issue](https://github.com/miketheman/unladen/issues)
+to discuss any change before opening a pull request.
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md)
+for development setup and the project workflow.
+
 ## Authors
 
 * [Mike Fiedler](https://github.com/miketheman)
