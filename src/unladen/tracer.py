@@ -451,10 +451,13 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
             if isinstance(target, ast.Name):
                 # Track ``obj = ClassName()`` so a later
                 # ``alias = obj.method`` resolves to ``ClassName.method``.
-                if isinstance(node.value, ast.Call) and isinstance(
-                    node.value.func, ast.Name
-                ):
-                    instances[target.id] = node.value.func.id
+                # Rebinding the name to anything else drops the mapping
+                # so a stale class is never used.
+                class_name = _constructor_class_name(node.value)
+                if class_name is not None:
+                    instances[target.id] = class_name
+                else:
+                    instances.pop(target.id, None)
                 refs = _names_in_value(node.value)
                 bound = _resolve_bound_method_alias(node.value, instances)
                 if bound:
@@ -514,6 +517,23 @@ def _resolve_bound_method_alias(
         and value.value.id in instances
     ):
         return f"{instances[value.value.id]}.{value.attr}"
+    return None
+
+
+def _constructor_class_name(value: ast.expr) -> str | None:
+    """Return the class name for a constructor call, or ``None``.
+
+    Handles bare ``ClassName()`` and dotted ``module.ClassName()``
+    instantiations.  The dotted form takes the final attribute,
+    mirroring ``_extract_base_names``.
+    """
+    if not isinstance(value, ast.Call):
+        return None
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
     return None
 
 

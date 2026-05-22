@@ -1590,3 +1590,54 @@ class TestBoundMethodAlias:
         # decode alias (1) + PyJWT.decode (2) + PyJWT._verify (2) = 5 active
         assert result.active_lloc == 5
         assert result.total_lloc == 7
+
+    def test_dotted_constructor_alias_traced(self, tmp_path):
+        """`obj = module.ClassName()` (dotted constructor) is tracked too."""
+        pkg = tmp_path / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            textwrap.dedent("""\
+            from mypkg import impl
+
+            _global = impl.PyJWT()
+            decode = _global.decode
+        """)
+        )
+        (pkg / "impl.py").write_text(
+            textwrap.dedent("""\
+            class PyJWT:
+                def decode(self, token):
+                    return self._verify(token)
+
+                def _verify(self, token):
+                    return token
+        """)
+        )
+        result = compute_heft([pkg], {"decode"}, "pyjwt")
+        # decode alias (1) + PyJWT.decode (2) + PyJWT._verify (2) = 5 active
+        assert result.active_lloc == 5
+        assert result.total_lloc == 8
+
+    def test_reassigned_instance_evicted(self, tmp_path):
+        """Rebinding the instance var to a non-constructor drops the stale
+        mapping, so a later alias gets no wrong-class edge."""
+        f = tmp_path / "api.py"
+        f.write_text(
+            textwrap.dedent("""\
+            class A:
+                def run(self):
+                    return self._work()
+
+                def _work(self):
+                    return 1
+
+            _other = 42
+            obj = A()
+            obj = _other
+            handler = obj.run
+        """)
+        )
+        result = compute_heft([f], {"handler"}, "pkg")
+        # `obj` was rebound to a non-constructor, so the stale `obj -> A`
+        # mapping is dropped and `handler` gets no bogus `A.run` edge.
+        assert result.active_lloc == 1
