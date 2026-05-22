@@ -1556,3 +1556,37 @@ class TestTypeCheckingElseCallGraph:
         assert tree is not None
         calls = _extract_calls_from_tree(tree)
         assert "_helper" in calls.get("real_func", set())
+
+
+class TestBoundMethodAlias:
+    """Module-level `name = instance.method` aliases (issue #25).
+
+    Libraries like pyjwt expose bound methods as module-level names::
+
+        _jwt_global_obj = PyJWT()
+        decode = _jwt_global_obj.decode
+
+    Heft must follow the alias back to the class method, not stop at
+    the one-line assignment.
+    """
+
+    def test_bound_method_alias_traced(self, tmp_path):
+        """A `name = instance.method` alias should reach the class method."""
+        f = tmp_path / "api.py"
+        f.write_text(
+            textwrap.dedent("""\
+            class PyJWT:
+                def decode(self, token):
+                    return self._verify(token)
+
+                def _verify(self, token):
+                    return token
+
+            _global = PyJWT()
+            decode = _global.decode
+        """)
+        )
+        result = compute_heft([f], {"decode"}, "pyjwt")
+        # decode alias (1) + PyJWT.decode (2) + PyJWT._verify (2) = 5 active
+        assert result.active_lloc == 5
+        assert result.total_lloc == 7

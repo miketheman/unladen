@@ -415,6 +415,9 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
     same-named methods in different classes don't collide.
     """
     calls: dict[str, set[str]] = {}
+    # Maps a local name to the class it was instantiated from
+    # (``obj = ClassName()``), so bound-method aliases can be resolved.
+    instances: dict[str, str] = {}
 
     for node in ast.iter_child_nodes(tree):
         if _is_type_checking_block(node):
@@ -446,7 +449,16 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
             # create edges to the classes/functions they hold.
             target = node.targets[0]
             if isinstance(target, ast.Name):
+                # Track ``obj = ClassName()`` so a later
+                # ``alias = obj.method`` resolves to ``ClassName.method``.
+                if isinstance(node.value, ast.Call) and isinstance(
+                    node.value.func, ast.Name
+                ):
+                    instances[target.id] = node.value.func.id
                 refs = _names_in_value(node.value)
+                bound = _resolve_bound_method_alias(node.value, instances)
+                if bound:
+                    refs = refs | {bound}
                 if refs:
                     calls[target.id] = refs
 
@@ -479,6 +491,30 @@ def _names_in_value(node: ast.expr) -> set[str]:
         # ``name = (lambda: _func)()`` → extract _func from body
         names.update(_names_in_value(node.body))
     return names
+
+
+def _resolve_bound_method_alias(
+    value: ast.expr, instances: dict[str, str]
+) -> str | None:
+    """Resolve a bound-method alias to its qualified ``ClassName.method`` name.
+
+    Handles the module-level ``alias = obj.method`` pattern where ``obj``
+    is a known instance of a class (recorded from ``obj = ClassName()``).
+    Libraries like pyjwt expose their public API this way::
+
+        _jwt_global_obj = PyJWT()
+        decode = _jwt_global_obj.decode
+
+    Returns ``None`` when *value* is not an attribute access on a
+    tracked instance.
+    """
+    if (
+        isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and value.value.id in instances
+    ):
+        return f"{instances[value.value.id]}.{value.attr}"
+    return None
 
 
 def _calls_in_body(node: ast.AST, class_name: str | None = None) -> set[str]:
