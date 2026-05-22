@@ -35,6 +35,7 @@ unladen = "unladen.cli:main"
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-codspeed>=5.0.2",
     "pytest-cov",
     "pytest-randomly",
     "pytest-socket",

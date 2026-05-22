@@ -4,6 +4,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/unladen)](https://pypi.org/project/unladen/)
 [![License](https://img.shields.io/pypi/l/unladen)](https://github.com/miketheman/unladen/blob/main/LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/miketheman/unladen/ci.yml?branch=main&label=CI)](https://github.com/miketheman/unladen/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/miketheman/unladen?utm_source=badge)
 [![Downloads](https://img.shields.io/pypi/dm/unladen)](https://pypi.org/project/unladen/)
 
 > [!WARNING]
