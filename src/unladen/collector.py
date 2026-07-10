@@ -20,6 +20,9 @@ from unladen._parsing import parse_file as _parse_file
 _RE_DEP_NAME = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
 # PEP 503: runs of [-_.] are equivalent and collapsed to a single hyphen.
 _RE_SEPARATOR = re.compile(r"[-_.]+")
+# Inline comment in a requirements line: '#' preceded by whitespace.
+# A bare '#' inside a URL fragment (e.g. '#egg=pkg') is not a comment.
+_RE_INLINE_COMMENT = re.compile(r"\s#")
 
 
 class DepInfo(TypedDict):
@@ -155,7 +158,10 @@ def _parse_pyproject_toml(pyproject_path: Path) -> list[str]:
     [tool.poetry.dependencies] table.
     """
     with open(pyproject_path, "rb") as f:
-        data = tomllib.load(f)
+        try:
+            data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"Invalid TOML in {pyproject_path}: {exc}") from exc
 
     # PEP 621: [project] dependencies = [...]
     raw_deps = data.get("project", {}).get("dependencies", [])
@@ -233,7 +239,10 @@ def _resolve_setup_list_kwarg(
 def _parse_setup_cfg(setup_cfg_path: Path) -> list[str]:
     """Parse install_requires from setup.cfg [options] section."""
     config = configparser.ConfigParser()
-    config.read(setup_cfg_path, encoding="utf-8")
+    try:
+        config.read(setup_cfg_path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise ValueError(f"Invalid setup.cfg at {setup_cfg_path}: {exc}") from exc
 
     raw = config.get("options", "install_requires", fallback="")
     if not raw.strip():
@@ -279,6 +288,14 @@ def _parse_requirements_txt(
         if not line or line.startswith("#"):
             continue
 
+        # Strip inline comments first so a comment containing a URL or
+        # option text doesn't trigger the skip checks below.
+        comment = _RE_INLINE_COMMENT.search(line)
+        if comment:
+            line = line[: comment.start()].rstrip()
+        if not line:
+            continue
+
         # -r / --requirement includes
         include_match = re.match(r"^(?:-r|--requirement)\s+(.+)$", line)
         if include_match:
@@ -294,11 +311,6 @@ def _parse_requirements_txt(
 
         # Skip URLs, paths, and editable installs
         if "://" in line or line.startswith(".") or line.startswith("/"):
-            continue
-
-        # Strip inline comments
-        line = line.split("#", 1)[0].strip()
-        if not line:
             continue
 
         deps.append(_normalize_dep_name(line))
@@ -355,13 +367,14 @@ def resolve_installed(
     us analyze a project's venv without activating it.
     """
     result = {}
+    dist_infos = _dist_info_index(site_packages)
 
     for dep_name in dep_names:
         try:
             dist = importlib.metadata.Distribution.at(
-                _find_dist_info(dep_name, site_packages)
+                _find_dist_info(dep_name, site_packages, dist_infos)
             )
-        except FileNotFoundError, StopIteration:
+        except FileNotFoundError:
             # Dependency declared but not installed
             result[dep_name] = {
                 "version": None,
@@ -464,17 +477,40 @@ def _find_site_packages_in_venv(venv_path: Path) -> Path | None:
     return None
 
 
-def _find_dist_info(dep_name: str, site_packages: Path) -> Path:
-    """Find the .dist-info directory for a given distribution name."""
-    normalized = dep_name.replace("-", "_").lower()
+def _dist_info_index(site_packages: Path) -> dict[str, Path]:
+    """Index .dist-info/.egg-info directories by normalized package name.
+
+    Built once per site-packages scan so resolving many dependencies
+    doesn't re-list the directory for each one.
+    """
+    index: dict[str, Path] = {}
     for entry in site_packages.iterdir():
         if entry.suffix in (".dist-info", ".egg-info"):
             # dist-info dirs are named like: package_name-version.dist-info
             dir_name = entry.stem.lower()  # e.g. "requests-2.31.0"
-            pkg_part = dir_name.rsplit("-", 1)[0].replace("-", "_")
-            if pkg_part == normalized:
-                return entry
-    raise FileNotFoundError(f"No dist-info found for {dep_name}")
+            pkg_part = _RE_SEPARATOR.sub("_", dir_name.rsplit("-", 1)[0])
+            index.setdefault(pkg_part, entry)
+    return index
+
+
+def _find_dist_info(
+    dep_name: str,
+    site_packages: Path,
+    index: dict[str, Path] | None = None,
+) -> Path:
+    """Find the .dist-info directory for a given distribution name.
+
+    Names are matched with all separator runs ([-_.]+) collapsed to a
+    single underscore, so legacy metadata dirs that keep dots
+    (e.g. ``zope.interface-6.0.egg-info``) still match.
+    """
+    if index is None:
+        index = _dist_info_index(site_packages)
+    normalized = _RE_SEPARATOR.sub("_", dep_name.lower())
+    try:
+        return index[normalized]
+    except KeyError:
+        raise FileNotFoundError(f"No dist-info found for {dep_name}") from None
 
 
 def _get_import_names(
