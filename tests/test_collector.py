@@ -706,15 +706,17 @@ class TestCollectPackageDeps:
 
 
 class TestCollectDependenciesEmptyDeps:
-    """Line 40: collect_dependencies returns {} when parse_dependencies returns []."""
+    """collect_dependencies returns {} when no dependency specs are found."""
 
     def test_returns_empty_dict_when_no_deps_declared(
         self, tmp_path, fake_site_packages, monkeypatch
     ):
-        # parse_dependencies normally raises when empty, so mock it to return []
+        # _find_dependencies normally raises when empty, so mock it to return []
         import unladen.collector as collector_mod
 
-        monkeypatch.setattr(collector_mod, "parse_dependencies", lambda *a, **kw: [])
+        monkeypatch.setattr(
+            collector_mod, "_find_dependencies", lambda *a, **kw: ([], "none")
+        )
         result = collect_dependencies(tmp_path, site_packages=fake_site_packages)
         assert result == {}
 
@@ -919,3 +921,68 @@ class TestMalformedConfigFiles:
         (tmp_path / "setup.cfg").write_text("[options]\n[options]\n")
         with pytest.raises(ValueError, match="Invalid setup.cfg"):
             parse_dependencies(tmp_path)
+
+
+class TestEnvironmentMarkers:
+    """Marker-gated deps carry their marker so absence isn't a false alarm."""
+
+    def test_marker_captured_from_pep621(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "p"\nversion = "0"\n'
+            "dependencies = [\n"
+            '  "requests>=2.0",\n'
+            "  'colorama ; sys_platform == \"win32\"',\n"
+            "]\n"
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == 'sys_platform == "win32"'
+        assert result["colorama"]["installed"] is False
+        assert result["requests"]["marker"] is None
+
+    def test_marker_captured_from_requirements(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text(
+            'requests\ncolorama; sys_platform == "win32"\n'
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == 'sys_platform == "win32"'
+
+    def test_marker_captured_from_poetry_dict(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.14"\n'
+            'colorama = { version = "*", markers = "sys_platform == \'win32\'" }\n'
+            'requests = "*"\n'
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == "sys_platform == 'win32'"
+        assert result["requests"]["marker"] is None
+        assert "python" not in result
+
+    def test_marker_captured_from_requires_dist(self, tmp_path):
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        di = sp / "mypkg-1.0.dist-info"
+        di.mkdir()
+        (di / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: mypkg\nVersion: 1.0\n"
+            "Requires-Dist: real-dep\n"
+            'Requires-Dist: win-dep ; sys_platform == "win32"\n'
+            'Requires-Dist: dev-dep ; extra == "dev"\n'
+        )
+        result = collect_package_deps("mypkg", sp)
+        assert result["win-dep"]["marker"] == 'sys_platform == "win32"'
+        assert result["real-dep"]["marker"] is None
+        assert "dev-dep" not in result
+
+    def test_parse_dependencies_still_normalizes_markered_specs(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text(
+            'Foo.Bar>=1.0 ; python_version < "3.10"\n'
+        )
+        deps = parse_dependencies(tmp_path)
+        assert deps == ["foo-bar"]

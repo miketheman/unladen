@@ -43,7 +43,13 @@ def cmd_show(args: argparse.Namespace) -> int:
     _show_header(console, dep_name, info, project_path, req_file)
 
     if not info["installed"]:
-        console.print("[dim]Declared but not installed.[/dim]\n")
+        if info.get("marker"):
+            console.print(
+                f"[dim]Declared with marker '{info['marker']}' — "
+                "not applicable in this environment.[/dim]\n"
+            )
+        else:
+            console.print("[dim]Declared but not installed.[/dim]\n")
         return 0
 
     # Phase 2: inspect

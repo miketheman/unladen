@@ -328,6 +328,7 @@ def _build_reports(dep_map, dep_summaries, hefts):
                 installed=info["installed"],
                 matched_import_names=summary.matched_import_names,
                 string_ref_count=len(summary.string_refs),
+                marker=info.get("marker"),
             )
         )
     return reports

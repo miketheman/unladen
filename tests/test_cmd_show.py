@@ -384,3 +384,20 @@ class TestShowNameNormalization:
         )
         assert ret == 0
         assert "Declared in" in capsys.readouterr().out
+
+
+class TestShowConditionalDep:
+    """Show explains marker-gated deps that are absent."""
+
+    def test_show_marker_gated_dep(self, tmp_path, capsys):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "myapp"\nversion = "0.1.0"\n'
+            "dependencies = ['colorama ; sys_platform == \"win32\"']\n"
+        )
+        sp = tmp_path / "fake_sp"
+        sp.mkdir()
+        ret = main(["show", "colorama", str(tmp_path), "--site-packages", str(sp)])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "not applicable" in out
+        assert "sys_platform" in out
