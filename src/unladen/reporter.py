@@ -88,7 +88,10 @@ class DepReport:
     def status(self) -> str:
         if not self.installed:
             return "not installed"
-        if not self.used_names and not self.string_ref_count:
+        # import_count catches ``import a.b`` with no attribute use:
+        # the dep is referenced even though no specific names resolved,
+        # so it must not be reported as removable.
+        if not self.used_names and not self.string_ref_count and not self.import_count:
             return "unused"
         return "used"
 

@@ -614,3 +614,30 @@ class TestRenderJson:
         data = json.loads(render_json([]))
         assert data["dependencies"] == []
         assert data["summary"]["total"] == 0
+
+
+class TestStatusWithImportsOnly:
+    """A dep referenced by ``import a.b`` with no resolved names is not unused."""
+
+    def test_status_used_with_only_import_count(self):
+        report = DepReport(
+            name="pkg",
+            version="1.0",
+            import_names=["pkg"],
+            used_names=set(),
+            heft=None,
+            recommendation=Recommendation.REVIEW,
+            import_count=1,
+        )
+        assert report.status == "used"
+
+    def test_status_unused_without_any_reference(self):
+        report = DepReport(
+            name="pkg",
+            version="1.0",
+            import_names=["pkg"],
+            used_names=set(),
+            heft=None,
+            recommendation=Recommendation.REMOVE,
+        )
+        assert report.status == "unused"

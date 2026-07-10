@@ -11,6 +11,7 @@ from unladen.inspector import (
     find_project_source,
     inspect_project,
     inspect_source_files,
+    inspect_source_files_counted,
 )
 
 
@@ -990,3 +991,91 @@ class TestSourceRootFromSetupPyMalformedPackageDir:
         sources = find_project_source(tmp_path)
         filenames = {p.name for p in sources}
         assert "core.py" in filenames
+
+
+class TestBareStringRefScoping:
+    """Bare-name strings only count inside settings-style assignments."""
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            'errors = {"click": "boom"}\n',
+            'label = "click"\n',
+            'plugins = ["click"]\n',  # lowercase target: not a settings list
+            'def f():\n    return "click"\n',
+        ],
+        ids=["dict-key", "plain-string", "lowercase-list", "return-value"],
+    )
+    def test_bare_name_outside_settings_ignored(self, tmp_path, content):
+        f = tmp_path / "mod.py"
+        f.write_text(content)
+        refs = extract_string_references(f, {"click"})
+        assert refs == {}
+
+    def test_bare_name_in_augassign_settings(self, tmp_path):
+        f = tmp_path / "settings.py"
+        f.write_text('INSTALLED_APPS = []\nINSTALLED_APPS += ["allauth"]\n')
+        refs = extract_string_references(f, {"allauth"})
+        assert refs["allauth"][0].value == "allauth"
+
+    def test_bare_name_in_annotated_settings(self, tmp_path):
+        f = tmp_path / "settings.py"
+        f.write_text('INSTALLED_APPS: list[str] = ["allauth"]\n')
+        refs = extract_string_references(f, {"allauth"})
+        assert refs["allauth"][0].value == "allauth"
+
+    def test_bare_name_in_settings_tuple(self, tmp_path):
+        f = tmp_path / "settings.py"
+        f.write_text('MIDDLEWARE = ("allauth",)\n')
+        refs = extract_string_references(f, {"allauth"})
+        assert refs["allauth"][0].value == "allauth"
+
+    def test_dotted_path_outside_settings_still_counts(self, tmp_path):
+        f = tmp_path / "mod.py"
+        f.write_text('handler = "whitenoise.middleware.WhiteNoiseMiddleware"\n')
+        refs = extract_string_references(f, {"whitenoise"})
+        assert "whitenoise" in refs
+
+
+class TestNamespacePackageDiscovery:
+    """Project packages without __init__.py (PEP 420) must be discovered."""
+
+    def test_namespace_package_collected(self, tmp_path):
+        pkg = tmp_path / "mypkg"
+        pkg.mkdir()
+        (pkg / "core.py").write_text("import requests\n")
+        sub = pkg / "sub"
+        sub.mkdir()
+        (sub / "util.py").write_text("x = 1\n")
+        files = find_project_source(tmp_path)
+        names = {f.name for f in files}
+        assert "core.py" in names
+        assert "util.py" in names
+
+    def test_namespace_recursion_skips_excluded_dirs(self, tmp_path):
+        pkg = tmp_path / "mypkg"
+        pkg.mkdir()
+        (pkg / "core.py").write_text("x = 1\n")
+        tests_dir = pkg / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_core.py").write_text("x = 1\n")
+        files = find_project_source(tmp_path)
+        names = {f.name for f in files}
+        assert "core.py" in names
+        assert "test_core.py" not in names
+
+
+class TestInspectSourceFilesCounted:
+    """inspect_source_files_counted returns usage and LLOC in one pass."""
+
+    def test_returns_usage_and_lloc(self, tmp_path):
+        f = tmp_path / "app.py"
+        f.write_text('import requests\nx = requests.get("u")\n')
+        usage, lloc = inspect_source_files_counted([f], {"requests"})
+        assert "requests" in usage
+        assert lloc == 2
+
+    def test_empty_input(self):
+        usage, lloc = inspect_source_files_counted([], {"requests"})
+        assert usage == {}
+        assert lloc == 0

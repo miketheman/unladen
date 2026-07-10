@@ -128,9 +128,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 def _cmd_check_project(args, project_path, req_file) -> int:
     """Check a project directory's dependency usage."""
-    from unladen._lloc import count_lloc
     from unladen.collector import _normalize_dep_name
-    from unladen.inspector import find_project_source, inspect_project
+    from unladen.inspector import find_project_source, inspect_source_files_counted
     from unladen.reporter import render_json, render_table
 
     dep_map = load_dep_map(project_path, req_file, args.site_packages)
@@ -152,12 +151,17 @@ def _cmd_check_project(args, project_path, req_file) -> int:
     for info in dep_map.values():
         all_import_names.update(info["import_names"])
 
-    usage = inspect_project(project_path, all_import_names)
+    project_source = find_project_source(project_path)
+    if not project_source:
+        print(
+            f"Warning: no Python source files found under {project_path}; "
+            "all dependencies will appear unused.",
+            file=sys.stderr,
+        )
+    usage, project_lloc = inspect_source_files_counted(project_source, all_import_names)
     dep_summaries, hefts = _analyze_deps(dep_map, usage)
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
-    project_source = find_project_source(project_path)
-    project_lloc = sum(count_lloc(f) for f in project_source)
 
     if args.output_format == "json":
         print(
@@ -186,7 +190,7 @@ def _cmd_check_package(args, package_name) -> int:
     """Check an installed package's dependency usage."""
 
     from unladen.collector import collect_package_deps, resolve_package_info
-    from unladen.inspector import inspect_source_files
+    from unladen.inspector import inspect_source_files_counted
     from unladen.reporter import render_json, render_table
 
     sp = args.site_packages or _discover_site_packages()
@@ -218,14 +222,10 @@ def _cmd_check_package(args, package_name) -> int:
     for info in dep_map.values():
         all_import_names.update(info["import_names"])
 
-    usage = inspect_source_files(source_files, all_import_names)
+    usage, project_lloc = inspect_source_files_counted(source_files, all_import_names)
     dep_summaries, hefts = _analyze_deps(dep_map, usage)
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
-
-    from unladen._lloc import count_lloc
-
-    project_lloc = sum(count_lloc(f) for f in source_files)
 
     if args.output_format == "json":
         print(render_json(reports, project_lloc=project_lloc))

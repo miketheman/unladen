@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
+from unladen._lloc import count_statements as _count_statements
 from unladen._parsing import is_setup_call as _is_setup_call
 from unladen._parsing import parse_file as _parse_file
 
@@ -99,17 +100,57 @@ def _walk_source_file(
             for base in node.bases:
                 if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
                     out_accesses.setdefault(base.value.id, set()).add(base.attr)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            _collect_settings_refs(node, file_path, known_import_names, out_string_refs)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # Dotted path strings (e.g. "whitenoise.middleware.WhiteNoise")
+            # count anywhere.  Bare names are only collected from
+            # settings-style assignments (see _collect_settings_refs) —
+            # matching any single-word string would mark a dependency
+            # "used" from an unrelated dict key or message text.
             value = node.value
-            if not value or " " in value or "/" in value:
+            if not value or " " in value or "/" in value or "." not in value:
                 continue
             top = value.split(".")[0]
             if top not in known_import_names:
                 continue
-            if "." in value or value == top:
-                out_string_refs.setdefault(top, []).append(
-                    StringRef(value=value, source_file=file_path, lineno=node.lineno)
-                )
+            out_string_refs.setdefault(top, []).append(
+                StringRef(value=value, source_file=file_path, lineno=node.lineno)
+            )
+
+
+def _collect_settings_refs(
+    node: ast.Assign | ast.AnnAssign | ast.AugAssign,
+    file_path: Path,
+    known_import_names: set[str],
+    out_string_refs: dict[str, list[StringRef]],
+) -> None:
+    """Collect bare-name string refs from settings-style assignments.
+
+    Django activates dependencies via bare names in ALL_CAPS list
+    settings (``INSTALLED_APPS = ["allauth"]``).  Only that shape —
+    a list/tuple/set literal assigned to an ALL_CAPS name — counts a
+    dotless string as a dependency reference.  Dotted strings are
+    handled by the generic constant branch in ``_walk_source_file``.
+    """
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    else:
+        targets = [node.target]
+    if node.value is None or not isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+        return
+    if not any(isinstance(t, ast.Name) and t.id.isupper() for t in targets):
+        return
+    for elt in node.value.elts:
+        if not isinstance(elt, ast.Constant) or not isinstance(elt.value, str):
+            continue
+        value = elt.value
+        if not value or " " in value or "/" in value or "." in value:
+            continue
+        if value in known_import_names:
+            out_string_refs.setdefault(value, []).append(
+                StringRef(value=value, source_file=file_path, lineno=elt.lineno)
+            )
 
 
 # Directories to never scan when discovering project source.
@@ -189,6 +230,11 @@ def _collect_packages(base_dir: Path, excluded: frozenset[str]) -> list[Path]:
                 continue
             if (child / "__init__.py").exists():
                 py_files.extend(sorted(child.rglob("*.py")))
+            else:
+                # PEP 420 namespace package (no __init__.py) or plain
+                # source directory: recurse with the same exclusion
+                # rules so its modules aren't silently invisible.
+                py_files.extend(_collect_packages(child, excluded))
 
     return py_files
 
@@ -317,18 +363,34 @@ def inspect_source_files(
     where source files are already known (from the installed
     package's source paths) and don't need project discovery.
     """
+    usage, _ = inspect_source_files_counted(source_files, known_import_names)
+    return usage
+
+
+def inspect_source_files_counted(
+    source_files: list[Path],
+    known_import_names: set[str],
+) -> tuple[dict[str, UsageEntry], int]:
+    """Inspect source files and count their total LLOC in one parse pass.
+
+    Returns ``(usage, total_lloc)``.  Parsing dominates inspection cost,
+    so counting LLOC from the already-parsed tree avoids the second
+    parse of every project file the CLI used to do via ``count_lloc``.
+    """
     if not source_files:
-        return {}
+        return {}, 0
 
     all_imports: list[ImportInfo] = []
     all_attr_accesses: dict[str, set[str]] = {}
     all_string_refs: dict[str, list[StringRef]] = {}
+    total_lloc = 0
 
     for f in source_files:
         tree = _parse_file(f)
         if tree is None:
             warnings.warn(f"Could not parse {f}, skipping", stacklevel=2)
             continue
+        total_lloc += _count_statements(tree)
         _walk_source_file(
             tree,
             f,
@@ -351,7 +413,7 @@ def inspect_source_files(
         else:
             usage[imp_name].setdefault("string_refs", []).extend(refs)
 
-    return usage
+    return usage, total_lloc
 
 
 def _resolve_imports(

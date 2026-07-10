@@ -34,6 +34,7 @@ Four phases, each in its own module under `src/unladen/`:
 - **LLOC**: Logical Lines of Code — executable `ast` statement nodes, excluding docstrings, comments, and `if TYPE_CHECKING:` blocks.
 - **Used names**: Names imported or accessed from a dependency (e.g. `get` from `requests.get()`), traced transitively through the dependency's internal call graph.
 - **String references**: Django-style activation via dotted path strings in settings (e.g. `INSTALLED_APPS`, `MIDDLEWARE`). Leaf names are extracted for heft computation.
+  Dotted paths count anywhere; bare names (`"allauth"`) only count inside list/tuple/set literals assigned to ALL_CAPS names, so an unrelated single-word string can't mark a dependency as used.
 
 ## Code Conventions
 

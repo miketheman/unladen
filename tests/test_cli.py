@@ -659,3 +659,26 @@ class TestJsonOutput:
         assert data["summary"]["excluded"] == 1
         names = {d["name"] for d in data["dependencies"]}
         assert "click" not in names
+
+
+class TestNoProjectSourceWarning:
+    """A project with zero discoverable source files warns loudly."""
+
+    def test_warns_when_no_source_files(self, tmp_path, fake_site_packages, capsys):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "empty"\nversion = "0.1.0"\n'
+            'dependencies = ["requests"]\n'
+        )
+        ret = main(["check", str(tmp_path), "--site-packages", str(fake_site_packages)])
+        assert ret == 0
+        assert "no Python source files" in capsys.readouterr().err
+
+
+class TestMalformedPyprojectError:
+    """Malformed pyproject.toml produces a clean error, not a traceback."""
+
+    def test_check_malformed_pyproject(self, tmp_path, capsys):
+        (tmp_path / "pyproject.toml").write_text("[project\ndependencies = [\n")
+        ret = main(["check", str(tmp_path)])
+        assert ret == 1
+        assert "Error:" in capsys.readouterr().err
