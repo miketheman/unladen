@@ -411,7 +411,7 @@ def resolve_installed(
     installer because its marker is false in this environment, so the
     reporter shows it as "not applicable" rather than "not installed".
     """
-    result = {}
+    result: dict[str, DepInfo] = {}
     dist_infos = _dist_info_index(site_packages)
     markers = markers or {}
 
@@ -422,26 +422,28 @@ def resolve_installed(
             )
         except FileNotFoundError:
             # Dependency declared but not installed
-            result[dep_name] = {
+            dep_info: DepInfo = {
                 "version": None,
                 "import_names": [],
                 "paths": [],
                 "installed": False,
                 "marker": markers.get(dep_name),
             }
+            result[dep_name] = dep_info
             continue
 
         version = dist.metadata["Version"]
         import_names = _get_import_names(dist, dep_name, site_packages)
         paths = _get_source_paths(import_names, site_packages, dist)
 
-        result[dep_name] = {
+        dep_info: DepInfo = {
             "version": version,
             "import_names": import_names,
             "paths": paths,
             "installed": True,
             "marker": markers.get(dep_name),
         }
+        result[dep_name] = dep_info
 
     return result
 
