@@ -46,6 +46,20 @@ class UsageEntry(TypedDict, total=False):
     string_refs: list[StringRef]
 
 
+_WALK_HANDLED_TYPES = frozenset(
+    {
+        ast.Constant,
+        ast.Attribute,
+        ast.Import,
+        ast.ImportFrom,
+        ast.ClassDef,
+        ast.Assign,
+        ast.AnnAssign,
+        ast.AugAssign,
+    }
+)
+
+
 def _walk_source_file(
     tree: ast.Module,
     file_path: Path,
@@ -61,7 +75,45 @@ def _walk_source_file(
     Results are appended to the caller's mutable output containers.
     """
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+        # Exact-class dispatch: ast.parse() never yields subclasses, so a
+        # frozenset membership test on the class rejects the (majority of)
+        # irrelevant nodes with one hash lookup instead of re-paying an
+        # isinstance chain's C-call overhead on every node.
+        cls = node.__class__
+        if cls not in _WALK_HANDLED_TYPES:
+            continue
+        if cls is ast.Constant:
+            # Dotted path strings (e.g. "whitenoise.middleware.WhiteNoise")
+            # count anywhere.  Bare names are only collected from
+            # settings-style assignments (see _collect_settings_refs) —
+            # matching any single-word string would mark a dependency
+            # "used" from an unrelated dict key or message text.
+            value = node.value
+            if (
+                value.__class__ is not str
+                or not value
+                or " " in value
+                or "/" in value
+                or "." not in value
+            ):
+                continue
+            top = value.split(".")[0]
+            if top not in known_import_names:
+                continue
+            out_string_refs.setdefault(top, []).append(
+                StringRef(value=value, source_file=file_path, lineno=node.lineno)
+            )
+        elif cls is ast.Attribute:
+            if isinstance(node.value, ast.Name):
+                out_accesses.setdefault(node.value.id, set()).add(node.attr)
+            elif isinstance(node.value, ast.Attribute) and isinstance(
+                node.value.value, ast.Name
+            ):
+                root = node.value.value.id
+                mid = node.value.attr
+                out_accesses.setdefault(root, set()).add(mid)
+                out_accesses.setdefault(mid, set()).add(node.attr)
+        elif cls is ast.Import:
             for alias in node.names:
                 out_imports.append(
                     ImportInfo(
@@ -72,7 +124,7 @@ def _walk_source_file(
                         lineno=node.lineno,
                     )
                 )
-        elif isinstance(node, ast.ImportFrom):
+        elif cls is ast.ImportFrom:
             if node.level and node.level > 0:
                 continue
             module = node.module or ""
@@ -86,37 +138,12 @@ def _walk_source_file(
                         lineno=node.lineno,
                     )
                 )
-        elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name):
-                out_accesses.setdefault(node.value.id, set()).add(node.attr)
-            elif isinstance(node.value, ast.Attribute) and isinstance(
-                node.value.value, ast.Name
-            ):
-                root = node.value.value.id
-                mid = node.value.attr
-                out_accesses.setdefault(root, set()).add(mid)
-                out_accesses.setdefault(mid, set()).add(node.attr)
-        elif isinstance(node, ast.ClassDef):
+        elif cls is ast.ClassDef:
             for base in node.bases:
                 if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
                     out_accesses.setdefault(base.value.id, set()).add(base.attr)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        elif cls is ast.Assign or cls is ast.AnnAssign or cls is ast.AugAssign:
             _collect_settings_refs(node, file_path, known_import_names, out_string_refs)
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            # Dotted path strings (e.g. "whitenoise.middleware.WhiteNoise")
-            # count anywhere.  Bare names are only collected from
-            # settings-style assignments (see _collect_settings_refs) —
-            # matching any single-word string would mark a dependency
-            # "used" from an unrelated dict key or message text.
-            value = node.value
-            if not value or " " in value or "/" in value or "." not in value:
-                continue
-            top = value.split(".")[0]
-            if top not in known_import_names:
-                continue
-            out_string_refs.setdefault(top, []).append(
-                StringRef(value=value, source_file=file_path, lineno=node.lineno)
-            )
 
 
 def _collect_settings_refs(
