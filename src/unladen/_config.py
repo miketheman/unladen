@@ -41,9 +41,10 @@ def load_dep_map(
 ):
     """Load dependency map, returning None on error.
 
-    Handles missing project paths and missing dependency files
+    Handles missing project paths, missing dependency files
     (FileNotFoundError from collector when no pyproject.toml,
-    setup.py, setup.cfg, or requirements.txt is found).
+    setup.py, setup.cfg, or requirements.txt is found), and
+    malformed configuration files (ValueError from collector).
     """
     from unladen.collector import collect_dependencies
 
@@ -57,6 +58,6 @@ def load_dep_map(
             site_packages=site_packages,
             requirements=req_file,
         )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return None

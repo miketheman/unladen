@@ -10,7 +10,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from unladen._parsing import is_setup_call as _is_setup_call
 from unladen._parsing import parse_file as _parse_file
@@ -20,6 +20,9 @@ from unladen._parsing import parse_file as _parse_file
 _RE_DEP_NAME = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
 # PEP 503: runs of [-_.] are equivalent and collapsed to a single hyphen.
 _RE_SEPARATOR = re.compile(r"[-_.]+")
+# Inline comment in a requirements line: '#' preceded by whitespace.
+# A bare '#' inside a URL fragment (e.g. '#egg=pkg') is not a comment.
+_RE_INLINE_COMMENT = re.compile(r"\s#")
 
 
 class DepInfo(TypedDict):
@@ -29,6 +32,9 @@ class DepInfo(TypedDict):
     import_names: list[str]
     paths: list[Path]
     installed: bool
+    # PEP 508 environment marker text (after ';'), if the dependency
+    # was declared conditionally (e.g. 'sys_platform == "win32"').
+    marker: NotRequired[str | None]
 
 
 def collect_dependencies(
@@ -38,8 +44,8 @@ def collect_dependencies(
     requirements: str | None = None,
 ) -> dict[str, DepInfo]:
     """Collect declared dependencies and locate their installed source code."""
-    declared = parse_dependencies(project_path, requirements=requirements)
-    if not declared:
+    specs, _ = _find_dependencies(project_path, requirements=requirements)
+    if not specs:
         return {}
 
     sp = site_packages or discover_site_packages(project_path)
@@ -49,7 +55,8 @@ def collect_dependencies(
             "Use --site-packages to specify one explicitly."
         )
 
-    return resolve_installed(declared, sp)
+    declared, markers = _names_and_markers(specs)
+    return resolve_installed(declared, sp, markers=markers)
 
 
 def parse_dependencies(
@@ -61,8 +68,38 @@ def parse_dependencies(
 
     Returns a list of PEP 508 dependency names (without version specifiers).
     """
-    deps, _ = _find_dependencies(project_path, requirements=requirements)
-    return deps
+    specs, _ = _find_dependencies(project_path, requirements=requirements)
+    return [_normalize_dep_name(spec) for spec in specs]
+
+
+def _names_and_markers(specs: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Split raw PEP 508 specs into normalized names and their markers.
+
+    Returns (names, {name: marker}) where markers only holds entries
+    for conditionally declared deps.  First marker wins on duplicates.
+    """
+    names: list[str] = []
+    markers: dict[str, str] = {}
+    for spec in specs:
+        name = _normalize_dep_name(spec)
+        names.append(name)
+        marker = _extract_marker(spec)
+        if marker and name not in markers:
+            markers[name] = marker
+    return names, markers
+
+
+def _extract_marker(spec: str) -> str | None:
+    """Extract the environment marker text from a PEP 508 spec.
+
+    ``'colorama ; sys_platform == "win32"'`` -> ``'sys_platform == "win32"'``
+    ``'requests>=2.0'`` -> ``None``
+    """
+    _, sep, marker = spec.partition(";")
+    if not sep:
+        return None
+    marker = marker.strip()
+    return marker or None
 
 
 def dependency_source(
@@ -87,7 +124,8 @@ def _find_dependencies(
         requirements: Explicit requirements file path (relative or absolute).
             When provided, skips all auto-detection.
 
-    Returns (dep_names, source_filename).
+    Returns (raw_dep_specs, source_filename).  Specs keep their version
+    constraints and environment markers; callers normalize as needed.
     """
     if requirements:
         req_path = Path(requirements)
@@ -155,21 +193,30 @@ def _parse_pyproject_toml(pyproject_path: Path) -> list[str]:
     [tool.poetry.dependencies] table.
     """
     with open(pyproject_path, "rb") as f:
-        data = tomllib.load(f)
+        try:
+            data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"Invalid TOML in {pyproject_path}: {exc}") from exc
 
     # PEP 621: [project] dependencies = [...]
     raw_deps = data.get("project", {}).get("dependencies", [])
     if raw_deps:
-        return [_normalize_dep_name(dep) for dep in raw_deps]
+        return [dep for dep in raw_deps if isinstance(dep, str)]
 
     # Poetry: [tool.poetry.dependencies] as a dict of name -> version spec
     poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
     if poetry_deps:
-        return [
-            _normalize_dep_name(name)
-            for name in poetry_deps
-            if name.lower() != "python"
-        ]
+        specs = []
+        for name, value in poetry_deps.items():
+            if name.lower() == "python":
+                continue
+            # Poetry's dict form carries markers separately:
+            # colorama = { version = "*", markers = "sys_platform == 'win32'" }
+            if isinstance(value, dict) and value.get("markers"):
+                specs.append(f"{name} ; {value['markers']}")
+            else:
+                specs.append(name)
+        return specs
 
     return []
 
@@ -190,7 +237,7 @@ def _parse_setup_py(setup_path: Path) -> list[str]:
     variables = _collect_list_variables(tree)
     strings = _resolve_setup_list_kwarg(tree, "install_requires", variables)
     if strings is not None:
-        return [_normalize_dep_name(s) for s in strings]
+        return strings
     return []
 
 
@@ -233,15 +280,16 @@ def _resolve_setup_list_kwarg(
 def _parse_setup_cfg(setup_cfg_path: Path) -> list[str]:
     """Parse install_requires from setup.cfg [options] section."""
     config = configparser.ConfigParser()
-    config.read(setup_cfg_path, encoding="utf-8")
+    try:
+        config.read(setup_cfg_path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise ValueError(f"Invalid setup.cfg at {setup_cfg_path}: {exc}") from exc
 
     raw = config.get("options", "install_requires", fallback="")
     if not raw.strip():
         return []
 
-    return [
-        _normalize_dep_name(line) for line in raw.strip().splitlines() if line.strip()
-    ]
+    return [line.strip() for line in raw.strip().splitlines() if line.strip()]
 
 
 def _parse_requirements_txt(
@@ -279,6 +327,14 @@ def _parse_requirements_txt(
         if not line or line.startswith("#"):
             continue
 
+        # Strip inline comments first so a comment containing a URL or
+        # option text doesn't trigger the skip checks below.
+        comment = _RE_INLINE_COMMENT.search(line)
+        if comment:
+            line = line[: comment.start()].rstrip()
+        if not line:
+            continue
+
         # -r / --requirement includes
         include_match = re.match(r"^(?:-r|--requirement)\s+(.+)$", line)
         if include_match:
@@ -296,12 +352,7 @@ def _parse_requirements_txt(
         if "://" in line or line.startswith(".") or line.startswith("/"):
             continue
 
-        # Strip inline comments
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-
-        deps.append(_normalize_dep_name(line))
+        deps.append(line)
 
     return deps
 
@@ -346,6 +397,7 @@ def discover_site_packages(project_path: Path) -> Path | None:
 def resolve_installed(
     dep_names: list[str],
     site_packages: Path,
+    markers: dict[str, str] | None = None,
 ) -> dict[str, DepInfo]:
     """Resolve declared dependencies to their installed locations.
 
@@ -353,21 +405,29 @@ def resolve_installed(
     the .dist-info directory, avoiding ``importlib.metadata.distributions()``
     which only searches the current interpreter's sys.path.  This lets
     us analyze a project's venv without activating it.
+
+    *markers* maps dep names to their PEP 508 environment marker text.
+    A marker-gated dep that is absent was most likely skipped by the
+    installer because its marker is false in this environment, so the
+    reporter shows it as "not applicable" rather than "not installed".
     """
     result: dict[str, DepInfo] = {}
+    dist_infos = _dist_info_index(site_packages)
+    markers = markers or {}
 
     for dep_name in dep_names:
         try:
             dist = importlib.metadata.Distribution.at(
-                _find_dist_info(dep_name, site_packages)
+                _find_dist_info(dep_name, site_packages, dist_infos)
             )
-        except FileNotFoundError, StopIteration:
+        except FileNotFoundError:
             # Dependency declared but not installed
             dep_info: DepInfo = {
                 "version": None,
                 "import_names": [],
                 "paths": [],
                 "installed": False,
+                "marker": markers.get(dep_name),
             }
             result[dep_name] = dep_info
             continue
@@ -381,6 +441,7 @@ def resolve_installed(
             "import_names": import_names,
             "paths": paths,
             "installed": True,
+            "marker": markers.get(dep_name),
         }
         result[dep_name] = dep_info
 
@@ -421,16 +482,17 @@ def collect_package_deps(
         _find_dist_info(package_name, site_packages)
     )
     requires = dist.metadata.get_all("Requires-Dist") or []
-    dep_names = []
+    specs = []
     for req in requires:
         # Skip extras-only deps: "foo ; extra == 'bar'"
         if "extra ==" in req or "extra==" in req:
             continue
-        dep_names.append(_normalize_dep_name(req))
+        specs.append(req)
 
-    if not dep_names:
+    if not specs:
         return {}
-    return resolve_installed(dep_names, site_packages)
+    dep_names, markers = _names_and_markers(specs)
+    return resolve_installed(dep_names, site_packages, markers=markers)
 
 
 def _normalize_dep_name(dep_spec: str) -> str:
@@ -466,17 +528,40 @@ def _find_site_packages_in_venv(venv_path: Path) -> Path | None:
     return None
 
 
-def _find_dist_info(dep_name: str, site_packages: Path) -> Path:
-    """Find the .dist-info directory for a given distribution name."""
-    normalized = dep_name.replace("-", "_").lower()
+def _dist_info_index(site_packages: Path) -> dict[str, Path]:
+    """Index .dist-info/.egg-info directories by normalized package name.
+
+    Built once per site-packages scan so resolving many dependencies
+    doesn't re-list the directory for each one.
+    """
+    index: dict[str, Path] = {}
     for entry in site_packages.iterdir():
         if entry.suffix in (".dist-info", ".egg-info"):
             # dist-info dirs are named like: package_name-version.dist-info
             dir_name = entry.stem.lower()  # e.g. "requests-2.31.0"
-            pkg_part = dir_name.rsplit("-", 1)[0].replace("-", "_")
-            if pkg_part == normalized:
-                return entry
-    raise FileNotFoundError(f"No dist-info found for {dep_name}")
+            pkg_part = _RE_SEPARATOR.sub("_", dir_name.rsplit("-", 1)[0])
+            index.setdefault(pkg_part, entry)
+    return index
+
+
+def _find_dist_info(
+    dep_name: str,
+    site_packages: Path,
+    index: dict[str, Path] | None = None,
+) -> Path:
+    """Find the .dist-info directory for a given distribution name.
+
+    Names are matched with all separator runs ([-_.]+) collapsed to a
+    single underscore, so legacy metadata dirs that keep dots
+    (e.g. ``zope.interface-6.0.egg-info``) still match.
+    """
+    if index is None:
+        index = _dist_info_index(site_packages)
+    normalized = _RE_SEPARATOR.sub("_", dep_name.lower())
+    try:
+        return index[normalized]
+    except KeyError:
+        raise FileNotFoundError(f"No dist-info found for {dep_name}") from None
 
 
 def _get_import_names(

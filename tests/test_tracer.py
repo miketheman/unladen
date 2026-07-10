@@ -1641,3 +1641,69 @@ class TestBoundMethodAlias:
         # `obj` was rebound to a non-constructor, so the stale `obj -> A`
         # mapping is dropped and `handler` gets no bogus `A.run` edge.
         assert result.active_lloc == 1
+
+
+class TestConditionalBlockCallGraph:
+    """Call edges must be extracted from defs inside try/if blocks,
+    matching the blocks _collect_defs descends into."""
+
+    def test_calls_inside_try_traced(self, tmp_path):
+        f = tmp_path / "compat.py"
+        f.write_text(
+            textwrap.dedent("""\
+            def _helper():
+                a = 1
+                b = 2
+                return a + b
+
+            try:
+                def fast_impl():
+                    return _helper()
+            except ImportError:
+                def fast_impl():
+                    return None
+        """)
+        )
+        calls = _extract_calls(f)
+        assert "_helper" in calls.get("fast_impl", set())
+        result = compute_heft([f], {"fast_impl"}, "compat")
+        # fast_impl (2) + _helper (4) reached through the call graph
+        assert result.active_lloc == 6
+
+    def test_calls_inside_if_else_traced(self, tmp_path):
+        f = tmp_path / "platform.py"
+        f.write_text(
+            textwrap.dedent("""\
+            import sys
+
+            def _real():
+                x = 1
+                return x
+
+            if sys.platform == "win32":
+                def api():
+                    return None
+            else:
+                def api():
+                    return _real()
+        """)
+        )
+        calls = _extract_calls(f)
+        assert "_real" in calls.get("api", set())
+
+    def test_registry_assign_inside_try_traced(self, tmp_path):
+        f = tmp_path / "registry.py"
+        f.write_text(
+            textwrap.dedent("""\
+            def loader():
+                x = 1
+                return x
+
+            try:
+                HANDLERS = {"default": loader}
+            except ImportError:
+                HANDLERS = {}
+        """)
+        )
+        calls = _extract_calls(f)
+        assert "loader" in calls.get("HANDLERS", set())

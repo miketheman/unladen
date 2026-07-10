@@ -63,6 +63,7 @@ class DepReport:
     file_count: int = 0  # number of files that import this dep
     matched_import_names: list[str] | None = None  # import names actually used
     string_ref_count: int = 0  # string references found (e.g. Django settings)
+    marker: str | None = None  # PEP 508 environment marker, if declared with one
 
     @property
     def is_native(self) -> bool:
@@ -87,8 +88,16 @@ class DepReport:
     @property
     def status(self) -> str:
         if not self.installed:
+            # A marker-gated dep that is absent was skipped by the
+            # installer because its marker is false here (e.g. a
+            # win32-only dep on Linux) — that is not a problem to fix.
+            if self.marker:
+                return "not applicable"
             return "not installed"
-        if not self.used_names and not self.string_ref_count:
+        # import_count catches ``import a.b`` with no attribute use:
+        # the dep is referenced even though no specific names resolved,
+        # so it must not be reported as removable.
+        if not self.used_names and not self.string_ref_count and not self.import_count:
             return "unused"
         return "used"
 
@@ -138,6 +147,7 @@ class DepReport:
             "version": self.version,
             "installed": self.installed,
             "status": self.status,
+            "marker": self.marker,
         }
         if self.installed:
             d["import_names"] = self.import_names
@@ -195,10 +205,20 @@ def recommend(heft: HeftResult) -> Recommendation:
 
     Native extensions (opaque_files > 0, minimal Python) get Keep (native)
     since LLOC-based analysis doesn't apply to compiled code.
+
+    Hybrid libraries (compiled extensions AND substantial Python, e.g.
+    numpy) are never recommended for Vendor/Rewrite: the compiled code
+    carries mass the LLOC analysis cannot see, so a low Python ratio
+    cannot justify inlining advice.  They cap at Review.
     """
-    # Primarily native: has compiled extensions with little Python to analyze
-    if heft.opaque_files and heft.total_lloc < MASS_THRESHOLD:
-        return Recommendation.KEEP_NATIVE
+    if heft.opaque_files:
+        # Primarily native: little Python to analyze
+        if heft.total_lloc < MASS_THRESHOLD:
+            return Recommendation.KEEP_NATIVE
+        # Hybrid native: ratio only describes the Python portion
+        if heft.heft_ratio > 0.25:
+            return Recommendation.KEEP
+        return Recommendation.REVIEW
 
     ratio = heft.heft_ratio
     high_mass = heft.total_lloc >= MASS_THRESHOLD
@@ -268,9 +288,12 @@ def render_table(
 
     for report in sorted(reports, key=lambda r: r.name):
         if not report.installed:
-            table.add_row(
-                report.name, "-", "-", "-", "-", "-", "[dim]not installed[/dim]"
+            label = (
+                f"[dim]conditional: {report.marker}[/dim]"
+                if report.marker
+                else "[dim]not installed[/dim]"
             )
+            table.add_row(report.name, "-", "-", "-", "-", "-", label)
             continue
 
         rec_text = f"[{report.rec_style}]{report.rec_display}[/{report.rec_style}]"

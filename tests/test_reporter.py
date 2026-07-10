@@ -614,3 +614,112 @@ class TestRenderJson:
         data = json.loads(render_json([]))
         assert data["dependencies"] == []
         assert data["summary"]["total"] == 0
+
+
+class TestStatusWithImportsOnly:
+    """A dep referenced by ``import a.b`` with no resolved names is not unused."""
+
+    def test_status_used_with_only_import_count(self):
+        report = DepReport(
+            name="pkg",
+            version="1.0",
+            import_names=["pkg"],
+            used_names=set(),
+            heft=None,
+            recommendation=Recommendation.REVIEW,
+            import_count=1,
+        )
+        assert report.status == "used"
+
+    def test_status_unused_without_any_reference(self):
+        report = DepReport(
+            name="pkg",
+            version="1.0",
+            import_names=["pkg"],
+            used_names=set(),
+            heft=None,
+            recommendation=Recommendation.REMOVE,
+        )
+        assert report.status == "unused"
+
+
+class TestConditionalDeps:
+    """Marker-gated absent deps show as 'not applicable', not a problem."""
+
+    def _conditional_report(self):
+        return DepReport(
+            name="colorama",
+            version=None,
+            import_names=[],
+            used_names=set(),
+            heft=None,
+            recommendation=None,
+            installed=False,
+            marker='sys_platform == "win32"',
+        )
+
+    def test_status_not_applicable(self):
+        assert self._conditional_report().status == "not applicable"
+
+    def test_status_not_installed_without_marker(self):
+        report = DepReport(
+            name="gone",
+            version=None,
+            import_names=[],
+            used_names=set(),
+            heft=None,
+            recommendation=None,
+            installed=False,
+        )
+        assert report.status == "not installed"
+
+    def test_table_shows_conditional(self):
+        output = StringIO()
+        render_table(
+            [self._conditional_report()],
+            console=Console(file=output, force_terminal=False, width=120),
+        )
+        text = output.getvalue()
+        assert "conditional" in text
+        assert "not installed" not in text
+
+    def test_to_dict_includes_marker(self):
+        d = self._conditional_report().to_dict()
+        assert d["marker"] == 'sys_platform == "win32"'
+        assert d["status"] == "not applicable"
+
+
+class TestRecommendHybridNative:
+    """Hybrid native libraries never get Vendor/Rewrite advice."""
+
+    @pytest.mark.parametrize(
+        ("total", "active", "ratio", "opaque", "expected"),
+        [
+            # numpy-shaped: huge Python surface, tiny traced ratio,
+            # compiled extensions carry the real mass -> Review, not Rewrite
+            (10000, 50, 0.005, 3, Recommendation.REVIEW),
+            (2000, 40, 0.02, 1, Recommendation.REVIEW),
+            # hybrid with high Python usage stays Keep
+            (10000, 3000, 0.30, 3, Recommendation.KEEP),
+            # primarily-native unchanged
+            (400, 0, 0.0, 2, Recommendation.KEEP_NATIVE),
+            # pure Python unchanged: low ratio + high mass still Rewrite
+            (10000, 50, 0.005, 0, Recommendation.REWRITE),
+        ],
+        ids=[
+            "hybrid-low-ratio",
+            "hybrid-vendor-range",
+            "hybrid-high-ratio",
+            "primarily-native",
+            "pure-python-rewrite",
+        ],
+    )
+    def test_hybrid_recommendations(self, total, active, ratio, opaque, expected):
+        heft = HeftResult(
+            "pkg",
+            total_lloc=total,
+            active_lloc=active,
+            heft_ratio=ratio,
+            opaque_files=opaque,
+        )
+        assert recommend(heft) == expected

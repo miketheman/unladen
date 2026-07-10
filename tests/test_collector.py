@@ -706,15 +706,17 @@ class TestCollectPackageDeps:
 
 
 class TestCollectDependenciesEmptyDeps:
-    """Line 40: collect_dependencies returns {} when parse_dependencies returns []."""
+    """collect_dependencies returns {} when no dependency specs are found."""
 
     def test_returns_empty_dict_when_no_deps_declared(
         self, tmp_path, fake_site_packages, monkeypatch
     ):
-        # parse_dependencies normally raises when empty, so mock it to return []
+        # _find_dependencies normally raises when empty, so mock it to return []
         import unladen.collector as collector_mod
 
-        monkeypatch.setattr(collector_mod, "parse_dependencies", lambda *a, **kw: [])
+        monkeypatch.setattr(
+            collector_mod, "_find_dependencies", lambda *a, **kw: ([], "none")
+        )
         result = collect_dependencies(tmp_path, site_packages=fake_site_packages)
         assert result == {}
 
@@ -862,3 +864,125 @@ class TestCollectListVariablesEdgeCases:
         )
         deps = parse_dependencies(tmp_path)
         assert "flask" in deps
+
+
+class TestInlineCommentOrdering:
+    """Inline comments must be stripped before URL/option skip checks."""
+
+    def test_inline_comment_with_url_kept(self, tmp_path):
+        """A URL inside an inline comment must not skip the dependency."""
+        (tmp_path / "requirements.txt").write_text(
+            "requests  # docs: https://example.com/requests\n"
+        )
+        deps = parse_dependencies(tmp_path)
+        assert deps == ["requests"]
+
+    def test_include_with_inline_comment_followed(self, tmp_path):
+        """-r includes with trailing comments are still followed."""
+        (tmp_path / "base.txt").write_text("click\n")
+        (tmp_path / "requirements.txt").write_text("-r base.txt  # shared deps\n")
+        deps = parse_dependencies(tmp_path)
+        assert deps == ["click"]
+
+    def test_url_fragment_not_treated_as_comment(self, tmp_path):
+        """'#egg=' with no preceding whitespace is a URL fragment;
+        the line is still skipped as a URL."""
+        (tmp_path / "requirements.txt").write_text(
+            "https://example.com/pkg.whl#egg=pkg\nrequests\n"
+        )
+        deps = parse_dependencies(tmp_path)
+        assert deps == ["requests"]
+
+
+class TestFindDistInfoDottedNames:
+    """Metadata dirs that keep dots in the name must still match."""
+
+    def test_egg_info_with_dots_matches(self, tmp_path):
+        egg = tmp_path / "zope.interface-6.0.egg-info"
+        egg.mkdir()
+        (egg / "PKG-INFO").write_text("Name: zope.interface\nVersion: 6.0\n")
+        result = resolve_installed(["zope-interface"], tmp_path)
+        assert result["zope-interface"]["installed"] is True
+
+    def test_missing_dist_info_reports_not_installed(self, tmp_path):
+        result = resolve_installed(["nonexistent"], tmp_path)
+        assert result["nonexistent"]["installed"] is False
+
+
+class TestMalformedConfigFiles:
+    """Malformed config files raise a clean ValueError, not a traceback."""
+
+    def test_malformed_pyproject_raises_value_error(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project\ndependencies = [\n")
+        with pytest.raises(ValueError, match="Invalid TOML"):
+            parse_dependencies(tmp_path)
+
+    def test_malformed_setup_cfg_raises_value_error(self, tmp_path):
+        (tmp_path / "setup.cfg").write_text("[options]\n[options]\n")
+        with pytest.raises(ValueError, match="Invalid setup.cfg"):
+            parse_dependencies(tmp_path)
+
+
+class TestEnvironmentMarkers:
+    """Marker-gated deps carry their marker so absence isn't a false alarm."""
+
+    def test_marker_captured_from_pep621(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "p"\nversion = "0"\n'
+            "dependencies = [\n"
+            '  "requests>=2.0",\n'
+            "  'colorama ; sys_platform == \"win32\"',\n"
+            "]\n"
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == 'sys_platform == "win32"'
+        assert result["colorama"]["installed"] is False
+        assert result["requests"]["marker"] is None
+
+    def test_marker_captured_from_requirements(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text(
+            'requests\ncolorama; sys_platform == "win32"\n'
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == 'sys_platform == "win32"'
+
+    def test_marker_captured_from_poetry_dict(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text(
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.14"\n'
+            'colorama = { version = "*", markers = "sys_platform == \'win32\'" }\n'
+            'requests = "*"\n'
+        )
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        result = collect_dependencies(tmp_path, site_packages=sp)
+        assert result["colorama"]["marker"] == "sys_platform == 'win32'"
+        assert result["requests"]["marker"] is None
+        assert "python" not in result
+
+    def test_marker_captured_from_requires_dist(self, tmp_path):
+        sp = tmp_path / "sp"
+        sp.mkdir()
+        di = sp / "mypkg-1.0.dist-info"
+        di.mkdir()
+        (di / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: mypkg\nVersion: 1.0\n"
+            "Requires-Dist: real-dep\n"
+            'Requires-Dist: win-dep ; sys_platform == "win32"\n'
+            'Requires-Dist: dev-dep ; extra == "dev"\n'
+        )
+        result = collect_package_deps("mypkg", sp)
+        assert result["win-dep"]["marker"] == 'sys_platform == "win32"'
+        assert result["real-dep"]["marker"] is None
+        assert "dev-dep" not in result
+
+    def test_parse_dependencies_still_normalizes_markered_specs(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text(
+            'Foo.Bar>=1.0 ; python_version < "3.10"\n'
+        )
+        deps = parse_dependencies(tmp_path)
+        assert deps == ["foo-bar"]

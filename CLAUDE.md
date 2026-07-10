@@ -34,6 +34,7 @@ Four phases, each in its own module under `src/unladen/`:
 - **LLOC**: Logical Lines of Code — executable `ast` statement nodes, excluding docstrings, comments, and `if TYPE_CHECKING:` blocks.
 - **Used names**: Names imported or accessed from a dependency (e.g. `get` from `requests.get()`), traced transitively through the dependency's internal call graph.
 - **String references**: Django-style activation via dotted path strings in settings (e.g. `INSTALLED_APPS`, `MIDDLEWARE`). Leaf names are extracted for heft computation.
+  Dotted paths count anywhere; bare names (`"allauth"`) only count inside list/tuple/set literals assigned to ALL_CAPS names, so an unrelated single-word string can't mark a dependency as used.
 
 ## Code Conventions
 
@@ -53,6 +54,10 @@ Four phases, each in its own module under `src/unladen/`:
 - **Single-pass AST walk**: `_walk_source_file()` extracts imports,
   attribute accesses, and string references in one `ast.walk` pass
   (was three separate walks; 44% faster on sphinx).
+  The hot loop rejects irrelevant nodes with a frozenset lookup on
+  `node.__class__` and dispatches with identity checks — `ast.parse()`
+  never yields subclasses, and an `isinstance` chain re-pays C-call
+  overhead on every node (~20% of the walk).
 - **Parse-once**: each file is parsed once and the AST tree is shared
   across LLOC counting, definition extraction, and call graph extraction.
 - **File-level parallelism**: `InterpreterPoolExecutor` (Python 3.14 subinterpreters)

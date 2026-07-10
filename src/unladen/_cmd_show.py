@@ -30,9 +30,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     if dep_map is None:
         return 1
 
-    dep_name = args.dep
+    # dep_map keys are PEP 503 normalized; accept any spelling the user
+    # gives (e.g. ``typing_extensions`` for ``typing-extensions``).
+    dep_name = _normalize_dep_name(args.dep)
     if dep_name not in dep_map:
-        print(f"Error: '{dep_name}' is not a declared dependency.", file=sys.stderr)
+        print(f"Error: '{args.dep}' is not a declared dependency.", file=sys.stderr)
         return 1
 
     info = dep_map[dep_name]
@@ -41,7 +43,13 @@ def cmd_show(args: argparse.Namespace) -> int:
     _show_header(console, dep_name, info, project_path, req_file)
 
     if not info["installed"]:
-        console.print("[dim]Declared but not installed.[/dim]\n")
+        if info.get("marker"):
+            console.print(
+                f"[dim]Declared with marker '{info['marker']}' — "
+                "not applicable in this environment.[/dim]\n"
+            )
+        else:
+            console.print("[dim]Declared but not installed.[/dim]\n")
         return 0
 
     # Phase 2: inspect

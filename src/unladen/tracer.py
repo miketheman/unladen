@@ -418,8 +418,21 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
     # Maps a local name to the class it was instantiated from
     # (``obj = ClassName()``), so bound-method aliases can be resolved.
     instances: dict[str, str] = {}
+    _extract_calls_from_children(tree, calls, instances)
+    return calls
 
-    for node in ast.iter_child_nodes(tree):
+
+def _extract_calls_from_children(
+    parent: ast.AST,
+    calls: dict[str, set[str]],
+    instances: dict[str, str],
+) -> None:
+    """Extract calls from *parent*'s children, descending into if/try blocks.
+
+    Descends into the same conditional/try blocks as ``_collect_defs``
+    so definitions found there also get call-graph edges.
+    """
+    for node in ast.iter_child_nodes(parent):
         if _is_type_checking_block(node):
             # Skip type-stub body but process the else-body
             # which contains runtime code (e.g. sentry_sdk's
@@ -427,13 +440,12 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
             assert isinstance(node, ast.If)
             if node.orelse:
                 wrapper = ast.Module(body=node.orelse, type_ignores=[])
-                for k, v in _extract_calls_from_tree(wrapper).items():
-                    calls.setdefault(k, set()).update(v)
+                _extract_calls_from_children(wrapper, calls, instances)
             continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             func_calls = _calls_in_body(node)
             func_calls.discard(node.name)
-            calls[node.name] = func_calls
+            calls.setdefault(node.name, set()).update(func_calls)
         elif isinstance(node, ast.ClassDef):
             class_name = node.name
             for class_child in ast.iter_child_nodes(node):
@@ -441,8 +453,12 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
                     method_calls = _calls_in_body(class_child, class_name)
                     qname = f"{class_name}.{class_child.name}"
                     method_calls.discard(qname)
-                    calls[qname] = method_calls
+                    calls.setdefault(qname, set()).update(method_calls)
                     calls.setdefault(class_name, set()).update(method_calls)
+        elif isinstance(node, (ast.If, ast.Try, ast.TryStar, ast.ExceptHandler)):
+            # Mirror _collect_defs: definitions inside conditional/try
+            # blocks (compat-library pattern) need call edges too.
+            _extract_calls_from_children(node, calls, instances)
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             # Module-level variable: extract referenced names from the
             # value so registry dicts (e.g. ``_languages = {'en': English}``)
@@ -463,9 +479,7 @@ def _extract_calls_from_tree(tree: ast.Module) -> dict[str, set[str]]:
                 if bound:
                     refs = refs | {bound}
                 if refs:
-                    calls[target.id] = refs
-
-    return calls
+                    calls.setdefault(target.id, set()).update(refs)
 
 
 def _names_in_value(node: ast.expr) -> set[str]:
