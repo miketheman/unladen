@@ -354,7 +354,7 @@ def resolve_installed(
     which only searches the current interpreter's sys.path.  This lets
     us analyze a project's venv without activating it.
     """
-    result = {}
+    result: dict[str, DepInfo] = {}
 
     for dep_name in dep_names:
         try:
@@ -363,24 +363,26 @@ def resolve_installed(
             )
         except FileNotFoundError, StopIteration:
             # Dependency declared but not installed
-            result[dep_name] = {
+            dep_info: DepInfo = {
                 "version": None,
                 "import_names": [],
                 "paths": [],
                 "installed": False,
             }
+            result[dep_name] = dep_info
             continue
 
         version = dist.metadata["Version"]
         import_names = _get_import_names(dist, dep_name, site_packages)
         paths = _get_source_paths(import_names, site_packages, dist)
 
-        result[dep_name] = {
+        dep_info: DepInfo = {
             "version": version,
             "import_names": import_names,
             "paths": paths,
             "installed": True,
         }
+        result[dep_name] = dep_info
 
     return result
 
