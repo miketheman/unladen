@@ -75,14 +75,15 @@ def _walk_source_file(
     Results are appended to the caller's mutable output containers.
     """
     for node in ast.walk(tree):
-        # Exact-class dispatch: ast.parse() never yields subclasses, so a
-        # frozenset membership test on the class rejects the (majority of)
-        # irrelevant nodes with one hash lookup instead of re-paying an
-        # isinstance chain's C-call overhead on every node.
-        cls = node.__class__
-        if cls not in _WALK_HANDLED_TYPES:
+        # ast.parse() never yields subclasses, so a frozenset membership
+        # test on the class rejects the (majority of) irrelevant nodes
+        # with one hash lookup instead of re-paying an isinstance chain's
+        # C-call overhead on every node.  The survivors are few, so the
+        # isinstance dispatch below (which type checkers can narrow,
+        # unlike class-identity comparisons) costs little.
+        if node.__class__ not in _WALK_HANDLED_TYPES:
             continue
-        if cls is ast.Constant:
+        if isinstance(node, ast.Constant):
             # Dotted path strings (e.g. "whitenoise.middleware.WhiteNoise")
             # count anywhere.  Bare names are only collected from
             # settings-style assignments (see _collect_settings_refs) —
@@ -90,7 +91,7 @@ def _walk_source_file(
             # "used" from an unrelated dict key or message text.
             value = node.value
             if (
-                value.__class__ is not str
+                not isinstance(value, str)
                 or not value
                 or " " in value
                 or "/" in value
@@ -103,7 +104,7 @@ def _walk_source_file(
             out_string_refs.setdefault(top, []).append(
                 StringRef(value=value, source_file=file_path, lineno=node.lineno)
             )
-        elif cls is ast.Attribute:
+        elif isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name):
                 out_accesses.setdefault(node.value.id, set()).add(node.attr)
             elif isinstance(node.value, ast.Attribute) and isinstance(
@@ -113,7 +114,7 @@ def _walk_source_file(
                 mid = node.value.attr
                 out_accesses.setdefault(root, set()).add(mid)
                 out_accesses.setdefault(mid, set()).add(node.attr)
-        elif cls is ast.Import:
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 out_imports.append(
                     ImportInfo(
@@ -124,7 +125,7 @@ def _walk_source_file(
                         lineno=node.lineno,
                     )
                 )
-        elif cls is ast.ImportFrom:
+        elif isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
                 continue
             module = node.module or ""
@@ -138,11 +139,11 @@ def _walk_source_file(
                         lineno=node.lineno,
                     )
                 )
-        elif cls is ast.ClassDef:
+        elif isinstance(node, ast.ClassDef):
             for base in node.bases:
                 if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
                     out_accesses.setdefault(base.value.id, set()).add(base.attr)
-        elif cls is ast.Assign or cls is ast.AnnAssign or cls is ast.AugAssign:
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             _collect_settings_refs(node, file_path, known_import_names, out_string_refs)
 
 
