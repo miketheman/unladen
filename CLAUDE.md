@@ -132,10 +132,12 @@ For each dep, the names activated by the project (or an upstream dep)
 are traced through its call graph; modules containing reached
 definitions are *active*, and only imports in active modules
 (plus ancestor `__init__.py` files) propagate usage downward.
-Imports inside a dep's source are classified ty-style by ordered
+A dep's declared import names are classified ty-style by ordered
 resolution (`classify_module` in `transitive.py`):
 the dep's own import names, then declared `Requires-Dist` import names,
 then `sys.stdlib_module_names`, else unknown.
+Only third-party names propagate; stdlib/unknown surfacing is future
+work (see FUTURE.md).
 Transitive deps that are also declared directly are excluded from the
 transitive report (already in the main report).
 Known limitations: names contributed by parents discovered after a dep

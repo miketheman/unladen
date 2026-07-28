@@ -31,13 +31,15 @@ def compute_heft(
         A HeftResult with total/active LLOC and the heft ratio.
     """
     index = index_dependency(dep_paths)
-    return _heft_from_index(index, used_names, dep_name)
+    return heft_from_index(index, used_names, dep_name)
 
 
-def _heft_from_index(
-    index: DepIndex, used_names: set[str], dep_name: str
-) -> HeftResult:
-    """Compute HeftResult from a pre-built dependency index."""
+def heft_from_index(index: DepIndex, used_names: set[str], dep_name: str) -> HeftResult:
+    """Compute HeftResult from a pre-built dependency index.
+
+    Public so callers that already hold a DepIndex (e.g. transitive
+    tracing) can compute heft without re-indexing the source tree.
+    """
     total_lloc = index["total_lloc"]
 
     if total_lloc == 0 or not used_names:
@@ -107,6 +109,7 @@ def compute_hefts_bulk(
             "functions": [],
             "opaque_files": dep_opaque[dep_name],
             "call_graph": {},
+            "module_files": {},
         }
         for dep_name in dep_opaque
     }
@@ -114,10 +117,11 @@ def compute_hefts_bulk(
     for i, result in enumerate(all_results):
         if result is None:
             continue
-        lloc, defs, calls = result
+        lloc, defs, calls, module, path = result
         idx = dep_indexes[file_dep[i]]
         idx["total_lloc"] += lloc
         idx["functions"].extend(defs)
+        idx["module_files"].setdefault(module, []).append(path)
         for name, callees in calls.items():
             try:
                 idx["call_graph"][name].update(callees)
@@ -126,7 +130,7 @@ def compute_hefts_bulk(
 
     # Phase D: compute heft from each assembled index
     return {
-        dep_name: _heft_from_index(idx, dep_used_names[dep_name], dep_name)
+        dep_name: heft_from_index(idx, dep_used_names[dep_name], dep_name)
         for dep_name, idx in dep_indexes.items()
     }
 
@@ -293,6 +297,39 @@ def active_modules(index: DepIndex, used_names: set[str]) -> set[str]:
     return {module for module, defs in ti.module_defs.items() if defs & matched}
 
 
+def active_files(
+    index: DepIndex, used_names: set[str], dep_paths: list[Path]
+) -> list[Path]:
+    """Return source files activated by *used_names*.
+
+    Maps active modules back to their files via the index's
+    ``module_files`` provenance, then adds ancestor ``__init__.py``
+    files — importing anything from a package executes every
+    ``__init__`` on the way down.  *dep_paths* bounds the ancestor walk
+    to the dependency's own package roots.
+    """
+    modules = active_modules(index, used_names)
+    module_files = index["module_files"]
+    selected: set[Path] = set()
+    for module in modules:
+        selected.update(module_files.get(module, ()))
+
+    # Paths in module_files are constructed verbatim under dep_paths,
+    # so plain lexical containment works — no resolve() needed.
+    roots = [p for p in dep_paths if p.is_dir()]
+    for f in list(selected):
+        root = next((r for r in roots if f.is_relative_to(r)), None)
+        if root is None:
+            continue
+        for d in f.parents:
+            init = d / "__init__.py"
+            if init.exists():
+                selected.add(init)
+            if d == root:
+                break
+    return sorted(selected)
+
+
 def index_dependency(dep_paths: list[Path]) -> DepIndex:
     """Index a dependency's source code.
 
@@ -313,10 +350,13 @@ def index_dependency(dep_paths: list[Path]) -> DepIndex:
 # takes ~5ms serially vs ~15ms with pool startup on a typical machine.
 _PARALLEL_THRESHOLD = 100
 
+# Per-file indexing result: (lloc, defs, calls, module_name, path).
+_FileIndex = tuple[int, list[FuncDef], dict[str, set[str]], str, Path]
+
 
 def _index_files(
     py_files: list[Path],
-) -> list[tuple[int, list[FuncDef], dict[str, set[str]]] | None]:
+) -> list[_FileIndex | None]:
     """Index files serially or in parallel based on count."""
     if len(py_files) >= _PARALLEL_THRESHOLD:
         return _index_files_parallel(py_files)
@@ -324,19 +364,21 @@ def _index_files(
 
 
 def _assemble_index(
-    file_results: list[tuple[int, list[FuncDef], dict[str, set[str]]] | None],
+    file_results: list[_FileIndex | None],
     opaque_files: int = 0,
 ) -> DepIndex:
     """Assemble a DepIndex from per-file indexing results."""
     total_lloc = 0
     functions: list[FuncDef] = []
     call_graph: dict[str, set[str]] = {}
+    module_files: dict[str, list[Path]] = {}
     for result in file_results:
         if result is None:
             continue
-        lloc, defs, calls = result
+        lloc, defs, calls, module, path = result
         total_lloc += lloc
         functions.extend(defs)
+        module_files.setdefault(module, []).append(path)
         for name, callees in calls.items():
             try:
                 call_graph[name].update(callees)
@@ -347,12 +389,11 @@ def _assemble_index(
         "functions": functions,
         "opaque_files": opaque_files,
         "call_graph": call_graph,
+        "module_files": module_files,
     }
 
 
-def _index_single_file(
-    py_file: Path,
-) -> tuple[int, list[FuncDef], dict[str, set[str]]] | None:
+def _index_single_file(py_file: Path) -> _FileIndex | None:
     """Parse, count LLOC, extract defs and calls from one file."""
     tree = _parse_file(py_file)
     if tree is None:
@@ -364,12 +405,12 @@ def _index_single_file(
     defs: list[FuncDef] = []
     _collect_defs(tree, module_name, defs)
     calls = _extract_calls_from_tree(tree)
-    return lloc, defs, calls
+    return lloc, defs, calls, module_name, py_file
 
 
 def _index_files_parallel(
     py_files: list[Path],
-) -> list[tuple[int, list[FuncDef], dict[str, set[str]]] | None]:
+) -> list[_FileIndex | None]:
     """Index files using parallel interpreter workers.
 
     Uses InterpreterPoolExecutor (Python 3.14+) for true parallelism.

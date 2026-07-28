@@ -300,49 +300,6 @@ class TestTraceTransitive:
         assert d["heft"]["total_lloc"] == 5
 
 
-class TestActiveFileSelection:
-    def test_nested_subpackage_walks_ancestors(self, tmp_path):
-        """An active file deep in a subpackage activates each ancestor
-        __init__.py up to the package root; namespace dirs (no
-        __init__.py) are traversed without error."""
-        from unladen.transitive import _active_files
-
-        pkg = tmp_path / "big"
-        (pkg / "sub").mkdir(parents=True)
-        (pkg / "nsdir").mkdir()
-        (pkg / "__init__.py").write_text("")
-        (pkg / "sub" / "__init__.py").write_text("")
-        (pkg / "sub" / "deep.py").write_text("def f():\n    return 1\n")
-        (pkg / "nsdir" / "mod.py").write_text("def g():\n    return 2\n")
-
-        files = _active_files([pkg], {"deep", "mod"})
-        assert pkg / "sub" / "deep.py" in files
-        assert pkg / "sub" / "__init__.py" in files
-        assert pkg / "__init__.py" in files
-        assert pkg / "nsdir" / "mod.py" in files
-
-    def test_single_file_module_dep(self, tmp_path):
-        """A single-file module dep has no package root to walk."""
-        from unladen.transitive import _active_files
-
-        mod = tmp_path / "flat.py"
-        mod.write_text("def f():\n    return 1\n")
-        files = _active_files([mod], {"flat"})
-        assert files == [mod]
-
-    def test_ancestor_init_files_included(self, chain_site_packages):
-        """Activating spam/core.py must also treat spam/__init__.py as
-        active — importing anything from a package executes its
-        ancestor __init__ modules."""
-        from unladen.transitive import _active_files
-
-        spam_pkg = chain_site_packages / "spam"
-        files = _active_files([spam_pkg], {"core"})
-        assert spam_pkg / "core.py" in files
-        assert spam_pkg / "__init__.py" in files
-        assert spam_pkg / "unused.py" not in files
-
-
 class TestCLIIntegration:
     @pytest.fixture
     def chain_project(self, tmp_path, chain_site_packages) -> Path:
@@ -442,7 +399,6 @@ def test_transitive_dep_dataclass_defaults():
     td = TransitiveDep(
         name="x",
         version="1.0",
-        import_names=["x"],
         used_names={"f"},
         via={"parent"},
         depth=1,

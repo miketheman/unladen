@@ -77,7 +77,7 @@ class DepReport:
             return "-"
         if self.is_native:
             return "n/a"
-        return f"{self.heft.heft_ratio * 100:.1f}%"
+        return _format_heft_pct(self.heft)
 
     @property
     def lloc_display(self) -> str:
@@ -85,7 +85,7 @@ class DepReport:
             return "-"
         if self.is_native:
             return _pluralize(self.heft.opaque_files, "extension", "extensions")
-        return f"{self.heft.active_lloc}/{self.heft.total_lloc}"
+        return _format_lloc(self.heft)
 
     @property
     def status(self) -> str:
@@ -157,19 +157,21 @@ class DepReport:
             d["import_count"] = self.import_count
             d["file_count"] = self.file_count
             d["string_ref_count"] = self.string_ref_count
-            if self.heft is not None:
-                d["heft"] = {
-                    "ratio": self.heft.heft_ratio,
-                    "active_lloc": self.heft.active_lloc,
-                    "total_lloc": self.heft.total_lloc,
-                    "opaque_files": self.heft.opaque_files,
-                }
-            else:
-                d["heft"] = None
+            d["heft"] = self.heft.to_dict() if self.heft is not None else None
             d["recommendation"] = (
                 self.recommendation.value if self.recommendation else None
             )
         return d
+
+
+def _format_heft_pct(heft: HeftResult) -> str:
+    """Format a heft ratio as a percentage, shared by all tables."""
+    return f"{heft.heft_ratio * 100:.1f}%"
+
+
+def _format_lloc(heft: HeftResult) -> str:
+    """Format active/total LLOC, shared by all tables."""
+    return f"{heft.active_lloc}/{heft.total_lloc}"
 
 
 def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
@@ -381,8 +383,8 @@ def render_transitive_table(
         if td.heft is None:
             heft_pct, lloc = "-", "-"
         else:
-            heft_pct = f"{td.heft.heft_ratio * 100:.1f}%"
-            lloc = f"{td.heft.active_lloc}/{td.heft.total_lloc}"
+            heft_pct = _format_heft_pct(td.heft)
+            lloc = _format_lloc(td.heft)
         table.add_row(
             td.name,
             td.version or "-",

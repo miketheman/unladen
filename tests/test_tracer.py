@@ -16,6 +16,7 @@ from unladen.tracer import (
     _resolve_call_target,
     _resolve_name,
     _TracerIndex,
+    active_files,
     compute_heft,
     compute_hefts_bulk,
     index_dependency,
@@ -1707,3 +1708,51 @@ class TestConditionalBlockCallGraph:
         )
         calls = _extract_calls(f)
         assert "loader" in calls.get("HANDLERS", set())
+
+
+class TestActiveFiles:
+    """active_files: map traced usage back to activated source files."""
+
+    def test_active_file_and_ancestor_inits(self, tmp_path):
+        """Activating a submodule also activates ancestor __init__.py
+        files (importing anything executes them), but not siblings."""
+        pkg = tmp_path / "spam"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("from spam.core import breakfast\n")
+        (pkg / "core.py").write_text("def breakfast():\n    return 1\n")
+        (pkg / "unused.py").write_text("def lunch():\n    return 2\n")
+
+        files = active_files(index_dependency([pkg]), {"breakfast"}, [pkg])
+        assert pkg / "core.py" in files
+        assert pkg / "__init__.py" in files
+        assert pkg / "unused.py" not in files
+
+    def test_nested_subpackage_walks_ancestors(self, tmp_path):
+        """A deep active file activates each ancestor __init__.py up to
+        the package root; namespace dirs (no __init__.py) are traversed
+        without error."""
+        pkg = tmp_path / "big"
+        (pkg / "sub").mkdir(parents=True)
+        (pkg / "nsdir").mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "sub" / "__init__.py").write_text("")
+        (pkg / "sub" / "deep.py").write_text("def f():\n    return 1\n")
+        (pkg / "nsdir" / "mod.py").write_text("def g():\n    return 2\n")
+
+        files = active_files(index_dependency([pkg]), {"f", "g"}, [pkg])
+        assert pkg / "sub" / "deep.py" in files
+        assert pkg / "sub" / "__init__.py" in files
+        assert pkg / "__init__.py" in files
+        assert pkg / "nsdir" / "mod.py" in files
+
+    def test_single_file_module_dep(self, tmp_path):
+        """A single-file module dep has no package root to walk."""
+        mod = tmp_path / "flat.py"
+        mod.write_text("def f():\n    return 1\n")
+        files = active_files(index_dependency([mod]), {"f"}, [mod])
+        assert files == [mod]
+
+    def test_no_used_names_yields_nothing(self, tmp_path):
+        mod = tmp_path / "flat.py"
+        mod.write_text("def f():\n    return 1\n")
+        assert active_files(index_dependency([mod]), set(), [mod]) == []

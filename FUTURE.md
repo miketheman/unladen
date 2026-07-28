@@ -101,10 +101,18 @@ simplifications worth revisiting:
   directly, that extra usage is dropped rather than raising the
   direct dep's heft.  Showing "direct + transitive" heft per dep
   would give a truer total-activation picture.
-- **Index reuse.**
-  Parent deps are re-indexed for active-module tracing even though
-  the bulk heft pass indexes them again.  Sharing the `DepIndex`
-  would roughly halve `--transitive` runtime.
+- **Index reuse with the main report.**
+  Within the transitive pass each dep is now indexed at most once
+  (the index built for active-file tracing is reused for heft),
+  but *direct* deps are still indexed separately by the main
+  report's bulk pass.  Having `compute_hefts_bulk` optionally
+  return its indexes (or active modules) would remove that
+  remaining duplication.
+- **Single site-packages resolution.**
+  Project mode re-runs `discover_site_packages` for `--transitive`
+  because `collect_dependencies` discards the path it discovered.
+  Threading the resolved path out of Phase 1 would guarantee both
+  reports analyze the same environment.
 - **Undeclared imports.**
   `classify_module` returns `UNKNOWN` for imports that are neither
   first-party, declared third-party, nor stdlib —

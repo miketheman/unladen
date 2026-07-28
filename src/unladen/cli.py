@@ -192,10 +192,7 @@ def _cmd_check_project(args, project_path, req_file) -> int:
     render_table(reports, console=console, excluded_count=len(excluded))
 
     if transitive is not None:
-        from unladen.reporter import render_transitive_table
-
-        console.print()
-        render_transitive_table(transitive, console=console)
+        _render_transitive(console, transitive)
 
     if args.treemap:
         _render_treemap_from_reports(
@@ -264,10 +261,7 @@ def _cmd_check_package(args, package_name) -> int:
     render_table(reports, console=console)
 
     if transitive is not None:
-        from unladen.reporter import render_transitive_table
-
-        console.print()
-        render_transitive_table(transitive, console=console)
+        _render_transitive(console, transitive)
 
     if args.treemap:
         _render_treemap_from_reports(console, reports, project_lloc)
@@ -300,19 +294,32 @@ def _analyze_deps(dep_map, usage):
 def _trace_transitive_deps(dep_map, dep_summaries, site_packages):
     """Bridge Phase 2.5 output to transitive tracing (``--transitive``).
 
-    Returns [] when site-packages could not be resolved so the reporter
-    still renders the (empty) transitive section rather than crashing.
+    Returns [] when site-packages could not be resolved (with a stderr
+    note, so an empty transitive section isn't mistaken for a finding).
     """
+    if site_packages is None:
+        print(
+            "Warning: could not resolve site-packages; skipping transitive analysis.",
+            file=sys.stderr,
+        )
+        return []
+
     from unladen.transitive import trace_transitive
 
-    if site_packages is None:
-        return []
     used_map = {
         name: summary.used_names
         for name, summary in dep_summaries.items()
         if summary.used_names
     }
     return trace_transitive(dep_map, used_map, site_packages)
+
+
+def _render_transitive(console, transitive) -> None:
+    """Render the transitive table after the main report."""
+    from unladen.reporter import render_transitive_table
+
+    console.print()
+    render_transitive_table(transitive, console=console)
 
 
 def _discover_site_packages() -> Path | None:

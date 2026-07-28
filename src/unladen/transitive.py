@@ -10,27 +10,33 @@ for a transitive dependency reflects what the project's own code
 ultimately activates, not everything the intermediate dependency could
 ever use.
 
-Module classification follows ty's search-path resolution order
-(first-party source, then third-party, then stdlib): an import found in
-a dependency's source is first-party if it resolves to the dependency's
-own import names, third-party if it resolves to an import name of one of
-its declared (``Requires-Dist``) dependencies, and stdlib if it appears
-in ``sys.stdlib_module_names``.  Unlike ty, declared third-party names
-win over stdlib names so backport packages (e.g. ``legacy-cgi``
-providing ``cgi``) attribute to the declaring dependency.
+A dependency's declared import names are classified by ordered
+resolution inspired by ty's search-path model (``classify_module``):
+first-party (the dependency's own import names), then third-party
+(import names of its ``Requires-Dist`` deps), then stdlib
+(``sys.stdlib_module_names``).  Only third-party names propagate usage.
+Unlike ty, declared third-party names win over stdlib names so backport
+packages (e.g. ``legacy-cgi`` providing ``cgi``) attribute to the
+declaring dependency.  The STDLIB/UNKNOWN classifications are not yet
+surfaced — see FUTURE.md for the undeclared-import idea they enable.
 """
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from unladen._types import HeftResult
-from unladen.collector import DepInfo, collect_package_deps
+from unladen._types import DepIndex, HeftResult
+from unladen.collector import DepInfo, _dist_info_index, collect_package_deps
 from unladen.inspector import inspect_source_files
 from unladen.merger import merge_dep_usage
-from unladen.tracer import _collect_source_files, active_modules, index_dependency
+from unladen.tracer import (
+    active_files,
+    compute_hefts_bulk,
+    heft_from_index,
+    index_dependency,
+)
 
 
 class ModuleOrigin(Enum):
@@ -69,31 +75,21 @@ class TransitiveDep:
 
     name: str
     version: str | None
-    import_names: list[str]
     used_names: set[str]
     via: set[str]  # parent distribution names that activate this dep
     depth: int  # 1 = dependency of a direct dependency
     heft: HeftResult | None = None
-    _paths: list[Path] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict suitable for JSON output."""
-        d: dict[str, Any] = {
+        return {
             "name": self.name,
             "version": self.version,
             "via": sorted(self.via),
             "depth": self.depth,
             "used_names": sorted(self.used_names),
-            "heft": None,
+            "heft": self.heft.to_dict() if self.heft is not None else None,
         }
-        if self.heft is not None:
-            d["heft"] = {
-                "ratio": self.heft.heft_ratio,
-                "active_lloc": self.heft.active_lloc,
-                "total_lloc": self.heft.total_lloc,
-                "opaque_files": self.heft.opaque_files,
-            }
-        return d
 
 
 def trace_transitive(
@@ -124,6 +120,10 @@ def trace_transitive(
     """
     direct = set(dep_map)
     found: dict[str, TransitiveDep] = {}
+    # Indexes built for parents are reused for their heft computation.
+    indexes: dict[str, DepIndex] = {}
+    paths: dict[str, list[Path]] = {}
+    dist_index = _dist_info_index(site_packages)
 
     frontier: list[tuple[str, DepInfo, set[str]]] = []
     for name, info in dep_map.items():
@@ -134,41 +134,41 @@ def trace_transitive(
     depth = 0
     while frontier and depth < max_depth:
         depth += 1
-        contributions: dict[str, set[str]] = {}
-        child_infos: dict[str, DepInfo] = {}
-        child_via: dict[str, set[str]] = {}
+        # One record per child discovered this level: (info, used, via).
+        pending: dict[str, tuple[DepInfo, set[str], set[str]]] = {}
 
         for name, info, used in frontier:
             for child_name, child_info, child_used in _child_usage(
-                name, info, used, site_packages
+                name, info, used, site_packages, indexes, dist_index
             ):
-                contributions.setdefault(child_name, set()).update(child_used)
-                child_infos[child_name] = child_info
-                child_via.setdefault(child_name, set()).add(name)
+                if child_name in pending:
+                    _, prev_used, prev_via = pending[child_name]
+                    prev_used.update(child_used)
+                    prev_via.add(name)
+                else:
+                    pending[child_name] = (child_info, child_used, {name})
 
         next_frontier: list[tuple[str, DepInfo, set[str]]] = []
-        for child_name, used_names in contributions.items():
+        for child_name, (info, used_names, via) in pending.items():
             if child_name in direct:
                 continue
             if child_name in found:
                 found[child_name].used_names.update(used_names)
-                found[child_name].via.update(child_via[child_name])
+                found[child_name].via.update(via)
                 continue
-            info = child_infos[child_name]
             td = TransitiveDep(
                 name=child_name,
                 version=info["version"],
-                import_names=info["import_names"],
-                used_names=set(used_names),
-                via=set(child_via[child_name]),
+                used_names=used_names,
+                via=via,
                 depth=depth,
-                _paths=info["paths"],
             )
             found[child_name] = td
+            paths[child_name] = info["paths"]
             next_frontier.append((child_name, info, td.used_names))
         frontier = next_frontier
 
-    _attach_hefts(found)
+    _attach_hefts(found, indexes, paths)
     return sorted(found.values(), key=lambda td: (td.depth, td.name))
 
 
@@ -177,17 +177,19 @@ def _child_usage(
     info: DepInfo,
     used: set[str],
     site_packages: Path,
+    indexes: dict[str, DepIndex],
+    dist_index: dict[str, Path],
 ) -> list[tuple[str, DepInfo, set[str]]]:
     """Find which names *name*'s active code uses from its own dependencies.
 
     Returns (child_dist_name, child_info, used_names) tuples for each
     installed child dependency referenced from an active module.
+    The index built here is cached in *indexes* for reuse by the
+    heft pass.
     """
     try:
-        children = collect_package_deps(name, site_packages)
+        children = collect_package_deps(name, site_packages, index=dist_index)
     except FileNotFoundError:
-        return []
-    if not children:
         return []
 
     own = set(info["import_names"])
@@ -202,9 +204,10 @@ def _child_usage(
     if not known:
         return []
 
-    index = index_dependency(info["paths"])
-    active = active_modules(index, used)
-    files = _active_files(info["paths"], active)
+    index = indexes.get(name)
+    if index is None:
+        index = indexes[name] = index_dependency(info["paths"])
+    files = active_files(index, used, info["paths"])
     if not files:
         return []
     usage = inspect_source_files(files, known)
@@ -221,48 +224,23 @@ def _child_usage(
     return results
 
 
-def _active_files(dep_paths: list[Path], active: set[str]) -> list[Path]:
-    """Select source files whose module is in the active set.
+def _attach_hefts(
+    found: dict[str, TransitiveDep],
+    indexes: dict[str, DepIndex],
+    paths: dict[str, list[Path]],
+) -> None:
+    """Compute heft for each discovered transitive dep.
 
-    Importing anything from a package executes every ancestor
-    ``__init__.py`` on the way down, so those are included as active
-    alongside the matched modules themselves.
+    Deps that served as parents already have an index cached — reuse it.
+    Leaves (never indexed) go through the bulk pool in one pass.
     """
-    py_files, _ = _collect_source_files(dep_paths)
-    roots = {p.resolve() for p in dep_paths if p.is_dir()}
-    selected: set[Path] = set()
-    for f in py_files:
-        module = f.parent.name if f.stem == "__init__" else f.stem
-        if module in active:
-            selected.add(f)
-
-    for f in list(selected):
-        root = next(
-            (r for r in roots if f.resolve().is_relative_to(r)),
-            None,
-        )
-        if root is None:
-            continue
-        d = f.parent
-        while d.resolve().is_relative_to(root):
-            init = d / "__init__.py"
-            if init.exists():
-                selected.add(init)
-            if d.resolve() == root:
-                break
-            d = d.parent
-    return sorted(selected)
-
-
-def _attach_hefts(found: dict[str, TransitiveDep]) -> None:
-    """Compute heft for each discovered transitive dep in one bulk pass."""
-    from unladen.tracer import compute_hefts_bulk
-
-    work = [
-        (name, td._paths, td.used_names)
-        for name, td in found.items()
-        if td._paths and td.used_names
-    ]
-    hefts = compute_hefts_bulk(work)
+    bulk_work: list[tuple[str, list[Path], set[str]]] = []
     for name, td in found.items():
-        td.heft = hefts.get(name)
+        if not td.used_names:
+            continue
+        if name in indexes:
+            td.heft = heft_from_index(indexes[name], td.used_names, name)
+        elif paths.get(name):
+            bulk_work.append((name, paths[name], td.used_names))
+    for name, heft in compute_hefts_bulk(bulk_work).items():
+        found[name].heft = heft

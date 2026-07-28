@@ -398,6 +398,7 @@ def resolve_installed(
     dep_names: list[str],
     site_packages: Path,
     markers: dict[str, str] | None = None,
+    index: dict[str, Path] | None = None,
 ) -> dict[str, DepInfo]:
     """Resolve declared dependencies to their installed locations.
 
@@ -410,9 +411,13 @@ def resolve_installed(
     A marker-gated dep that is absent was most likely skipped by the
     installer because its marker is false in this environment, so the
     reporter shows it as "not applicable" rather than "not installed".
+
+    *index* is an optional pre-built dist-info index (from
+    ``_dist_info_index``) so callers resolving many packages against
+    the same site-packages don't re-list the directory each time.
     """
     result: dict[str, DepInfo] = {}
-    dist_infos = _dist_info_index(site_packages)
+    dist_infos = index if index is not None else _dist_info_index(site_packages)
     markers = markers or {}
 
     for dep_name in dep_names:
@@ -470,6 +475,7 @@ def resolve_package_info(
 def collect_package_deps(
     package_name: str,
     site_packages: Path,
+    index: dict[str, Path] | None = None,
 ) -> dict[str, DepInfo]:
     """Collect dependencies declared in a package's Requires-Dist metadata.
 
@@ -477,9 +483,11 @@ def collect_package_deps(
     dependencies, then resolves them in site-packages.
     Skips extras-only deps (``; extra == "dev"``) since those are
     optional and not activated by default installation.
+    *index* is an optional pre-built dist-info index, passed through
+    to name resolution (see ``resolve_installed``).
     """
     dist = importlib.metadata.Distribution.at(
-        _find_dist_info(package_name, site_packages)
+        _find_dist_info(package_name, site_packages, index)
     )
     requires = dist.metadata.get_all("Requires-Dist") or []
     specs = []
@@ -492,7 +500,7 @@ def collect_package_deps(
     if not specs:
         return {}
     dep_names, markers = _names_and_markers(specs)
-    return resolve_installed(dep_names, site_packages, markers=markers)
+    return resolve_installed(dep_names, site_packages, markers=markers, index=index)
 
 
 def _normalize_dep_name(dep_spec: str) -> str:
