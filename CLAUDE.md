@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Project
 
 `unladen` is a CLI tool that measures the "logical mass" of Python dependencies
@@ -12,6 +14,17 @@ Setup, `just` recipes, and the contribution workflow live in
 [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 Run `just` to list all recipes.
 
+- `just test` — run the test suite
+  (`just test tests/test_tracer.py` for one file, `just test -k name` for one test).
+- `just cov` — tests with coverage report.
+- `just lint` — `ruff` lint and format check; `just fmt` auto-fixes.
+- `just typecheck` — type-check with `ty`.
+- `just check` — lint, typecheck, and test; run this after changes.
+- `just run <args>` — run the `unladen` CLI locally.
+
+Development is test-first: add a failing test, then make it pass.
+Open an issue before writing code; deferred ideas live in `FUTURE.md`.
+
 ## Architecture
 
 Four phases, each in its own module under `src/unladen/`:
@@ -22,9 +35,12 @@ Four phases, each in its own module under `src/unladen/`:
 | `inspector.py` | 2. Inspect (Flight) | Single-pass AST walk for imports, attribute accesses, string references |
 | `merger.py` | 2.5. Merge | Aggregate per-import-name usage into per-distribution summaries; namespace filtering |
 | `tracer.py` | 3. Trace (Weight) | Index dependency source, build call graph, BFS from entry points, compute LLOC heft ratio |
-| `reporter.py` | 4. Report (Coconut) | Format results as a `rich` table with recommendations |
-| `treemap.py` | 4. Visualize | Squarified treemap rendering via Rich |
-| `cli.py` | Orchestration | `argparse` CLI, wires phases together for `check`/`show` commands |
+| `reporter.py` | 4. Report (Coconut) | Format results as a `rich` table (or JSON) with recommendations |
+| `treemap.py` | 4. Visualize | Squarified treemap rendering via Rich (`check --treemap`) |
+| `cli.py` | Orchestration | `argparse` CLI, wires phases together for the `check` command |
+| `_cmd_show.py` | Orchestration | The `show` command: per-dependency detail with file:line locations |
+| `_config.py` | Shared | `load_config()`, `load_exclude_set()`, `load_dep_map()` — config and CLI helpers shared by `check`/`show` |
+| `_lloc.py` | Shared | LLOC counting: `count_lloc()`, `count_statements()`, `is_type_checking_block()` |
 | `_parsing.py` | Shared | `parse_file()`, `is_setup_call()` — shared AST utilities |
 | `_types.py` | Shared | `HeftResult`, `FuncDef`, `DepIndex` — cross-phase type definitions |
 
@@ -39,7 +55,8 @@ Four phases, each in its own module under `src/unladen/`:
 ## Code Conventions
 
 - All AST parsing uses `except SyntaxError, UnicodeDecodeError:` (PEP 758, Python 3.14+).
-- Lazy imports inside command functions (`_cmd_check`, `_cmd_show`) to keep CLI startup fast.
+- Lazy imports inside command functions (`_cmd_check*` in `cli.py`;
+  `cmd_show` is itself imported lazily in `main()`) to keep CLI startup fast.
 - `_normalize_dep_name()` handles PEP 503 normalization with regex (no external `packaging` dependency).
 - Private alias resolution: if used name `X` not found in definitions but `_X` is, treat as alias.
 - **Qualified method names**: methods are indexed as `ClassName.method` in the tracer
@@ -48,6 +65,8 @@ Four phases, each in its own module under `src/unladen/`:
   to bare names for inherited methods.
 - `_PARALLEL_THRESHOLD = 100` — file count below which serial indexing is used
   (avoids subinterpreter startup overhead for small deps).
+- Read-only analysis: `unladen` never executes third-party code —
+  no `eval()`, `exec()`, `subprocess`, or shell invocations anywhere. Keep it that way.
 
 ## Performance
 
@@ -69,14 +88,17 @@ Four phases, each in its own module under `src/unladen/`:
   into a single worker pool, avoiding per-dep overhead.
 - **`_TracerIndex`**: single-pass construction of all BFS lookup tables
   (lloc_by_name, classes, method_of, module_defs, class_methods, bare_to_qualified).
+- Benchmarks live in `tests/test_benchmarks.py` (`pytest-codspeed`,
+  tracked in CI via CodSpeed) — check them when touching hot paths.
 
 ## Testing
 
-- `pytest` with `pytest-cov`, `pytest-randomly`.
+- `pytest` with `pytest-cov`, `pytest-randomly`, `pytest-codspeed`,
+  and `pytest-socket` (tests run with `--disable-socket`; no network access).
 - Tests live in `tests/`, one file per module (`test_collector.py`, `test_inspector.py`, etc.).
 - Fixtures in `tests/conftest.py` — `sample_project`, `fake_site_packages`, etc.
 - Run `just test` or `just cov` — minimum 95% coverage (configured in `pyproject.toml`).
-- Always run tests and lint after changes: `just test && just lint`.
+- Always run `just check` (lint, typecheck, test) after changes.
 - Use `@pytest.mark.parametrize` for repetitive test patterns
   (e.g. normalization, recommendations, dynamic dispatch detection).
 
@@ -94,6 +116,11 @@ The `check` command supports two modes:
 
 Detection: if the target resolves to an existing directory, project mode;
 otherwise package mode.
+
+Flags: `--site-packages` (explicit site-packages path),
+`-r`/`--requirements` (explicit requirements file),
+`--treemap` (LLOC treemap visualization),
+`--format table|json`.
 
 ## Namespace Package Handling
 
@@ -143,6 +170,7 @@ which reuses `_normalize_dep_name()` from `collector.py`.
 ## Style
 
 - Linting: `ruff` with `E`, `F`, `I`, `UP` rules, target Python 3.14.
+- Type checking: `ty` (source rooted at `src/`, `tests/fixtures/` excluded).
 - Documentation: use semantic line breaks per [sembr.org](https://sembr.org).
 - No emojis in code or output unless requested.
 - Keep changes minimal — don't refactor surrounding code when fixing a bug.
