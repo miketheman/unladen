@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
     from rich.console import Console
 
+    from unladen.transitive import TransitiveDep
+
 from unladen._types import HeftResult
 
 # Mass threshold separating "small" from "large" dependencies.
@@ -241,11 +243,14 @@ def render_json(
     output: Path | None = None,
     excluded_count: int = 0,
     project_lloc: int = 0,
+    transitive: list[TransitiveDep] | None = None,
 ) -> str:
     """Serialize dependency reports as JSON.
 
     Returns the JSON string.
     When *output* is given, also writes to that file path.
+    When *transitive* is given (``--transitive``), a ``transitive``
+    key is added with per-dep usage traced through the dependency graph.
     """
     payload: dict[str, Any] = {
         "dependencies": [r.to_dict() for r in sorted(reports, key=lambda r: r.name)],
@@ -257,6 +262,8 @@ def render_json(
             "project_lloc": project_lloc,
         },
     }
+    if transitive is not None:
+        payload["transitive"] = [td.to_dict() for td in transitive]
     text = json.dumps(payload, indent=2)
     if output is not None:
         output.write_text(text, encoding="utf-8")
@@ -340,3 +347,50 @@ def render_table(
             f"[dim]* {excluded_count} dependenc{s} excluded "
             f"via \\[tool.unladen] config[/dim]"
         )
+
+
+def render_transitive_table(
+    transitive: list[TransitiveDep],
+    *,
+    console: Console,
+) -> None:
+    """Render transitive dependency usage as a rich table.
+
+    No recommendation column: a transitive dep cannot be removed
+    directly — its presence is decided by the parent shown in "Via".
+    """
+    if not transitive:
+        console.print(
+            "[dim]No transitive dependency usage detected from active code paths.[/dim]"
+        )
+        return
+
+    table = Table(
+        title="unladen - Transitive Dependency Heft (experimental)",
+        show_lines=True,
+    )
+    table.add_column("Dependency", style="bold")
+    table.add_column("Version")
+    table.add_column("Via")
+    table.add_column("Depth", justify="right")
+    table.add_column("Names\nUsed", justify="right")
+    table.add_column("Heft %", justify="right")
+    table.add_column("LLOC\n(active/total)", justify="right")
+
+    for td in transitive:
+        if td.heft is None:
+            heft_pct, lloc = "-", "-"
+        else:
+            heft_pct = f"{td.heft.heft_ratio * 100:.1f}%"
+            lloc = f"{td.heft.active_lloc}/{td.heft.total_lloc}"
+        table.add_row(
+            td.name,
+            td.version or "-",
+            ", ".join(sorted(td.via)),
+            str(td.depth),
+            str(len(td.used_names)),
+            heft_pct,
+            lloc,
+        )
+
+    console.print(table)

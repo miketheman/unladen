@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show a treemap visualization of dependency LLOC.",
     )
     check_parser.add_argument(
+        "--transitive",
+        action="store_true",
+        help="Trace usage through transitive dependencies (experimental).",
+    )
+    check_parser.add_argument(
         "--format",
         choices=["table", "json"],
         default="table",
@@ -163,12 +168,20 @@ def _cmd_check_project(args, project_path, req_file) -> int:
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
 
+    transitive = None
+    if args.transitive:
+        from unladen.collector import discover_site_packages
+
+        sp = args.site_packages or discover_site_packages(project_path)
+        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp)
+
     if args.output_format == "json":
         print(
             render_json(
                 reports,
                 excluded_count=len(excluded),
                 project_lloc=project_lloc,
+                transitive=transitive,
             )
         )
         return 0
@@ -177,6 +190,12 @@ def _cmd_check_project(args, project_path, req_file) -> int:
 
     console = Console()
     render_table(reports, console=console, excluded_count=len(excluded))
+
+    if transitive is not None:
+        from unladen.reporter import render_transitive_table
+
+        console.print()
+        render_transitive_table(transitive, console=console)
 
     if args.treemap:
         _render_treemap_from_reports(
@@ -227,8 +246,12 @@ def _cmd_check_package(args, package_name) -> int:
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
 
+    transitive = None
+    if args.transitive:
+        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp)
+
     if args.output_format == "json":
-        print(render_json(reports, project_lloc=project_lloc))
+        print(render_json(reports, project_lloc=project_lloc, transitive=transitive))
         return 0
 
     from rich.console import Console
@@ -239,6 +262,12 @@ def _cmd_check_package(args, package_name) -> int:
         f"— {len(dep_map)} dependencies\n"
     )
     render_table(reports, console=console)
+
+    if transitive is not None:
+        from unladen.reporter import render_transitive_table
+
+        console.print()
+        render_transitive_table(transitive, console=console)
 
     if args.treemap:
         _render_treemap_from_reports(console, reports, project_lloc)
@@ -266,6 +295,24 @@ def _analyze_deps(dep_map, usage):
 
     hefts = compute_hefts_bulk(heft_work)
     return dep_summaries, hefts
+
+
+def _trace_transitive_deps(dep_map, dep_summaries, site_packages):
+    """Bridge Phase 2.5 output to transitive tracing (``--transitive``).
+
+    Returns [] when site-packages could not be resolved so the reporter
+    still renders the (empty) transitive section rather than crashing.
+    """
+    from unladen.transitive import trace_transitive
+
+    if site_packages is None:
+        return []
+    used_map = {
+        name: summary.used_names
+        for name, summary in dep_summaries.items()
+        if summary.used_names
+    }
+    return trace_transitive(dep_map, used_map, site_packages)
 
 
 def _discover_site_packages() -> Path | None:

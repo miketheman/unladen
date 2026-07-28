@@ -279,6 +279,20 @@ def _sum_active_lloc(matched: set[str], ti: _TracerIndex) -> int:
     return total
 
 
+def active_modules(index: DepIndex, used_names: set[str]) -> set[str]:
+    """Return names of modules containing definitions reached from *used_names*.
+
+    Runs the same BFS as heft computation and maps the matched
+    definitions back to their modules.  Used by transitive tracing to
+    decide which of a dependency's files count as activated.
+    """
+    if not used_names:
+        return set()
+    ti = _TracerIndex(index["functions"])
+    matched = _trace_reachable(used_names, ti, index["call_graph"])
+    return {module for module, defs in ti.module_defs.items() if defs & matched}
+
+
 def index_dependency(dep_paths: list[Path]) -> DepIndex:
     """Index a dependency's source code.
 

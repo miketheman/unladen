@@ -87,6 +87,31 @@ These are currently invisible to the inspector.
 Detecting this pattern could improve
 heft accuracy for typing-heavy projects.
 
+### Transitive measurement: follow-ups
+
+`check --transitive` (experimental) ships with deliberate
+simplifications worth revisiting:
+
+- **Fixpoint iteration.**
+  Each dep is processed once with the used names known when dequeued;
+  names contributed by later-discovered parents count toward heft
+  but do not re-propagate to grandchildren.
+- **Transitive usage into direct deps.**
+  When a dependency's active code uses a dep the project also declares
+  directly, that extra usage is dropped rather than raising the
+  direct dep's heft.  Showing "direct + transitive" heft per dep
+  would give a truer total-activation picture.
+- **Index reuse.**
+  Parent deps are re-indexed for active-module tracing even though
+  the bulk heft pass indexes them again.  Sharing the `DepIndex`
+  would roughly halve `--transitive` runtime.
+- **Undeclared imports.**
+  `classify_module` returns `UNKNOWN` for imports that are neither
+  first-party, declared third-party, nor stdlib —
+  surfacing those would flag missing `Requires-Dist` entries.
+- **Treemap integration.**
+  Transitive deps could render as nested tiles under their parent.
+
 ## CLI and UX
 
 ### `--include-tests` flag

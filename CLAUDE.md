@@ -35,6 +35,7 @@ Four phases, each in its own module under `src/unladen/`:
 | `inspector.py` | 2. Inspect (Flight) | Single-pass AST walk for imports, attribute accesses, string references |
 | `merger.py` | 2.5. Merge | Aggregate per-import-name usage into per-distribution summaries; namespace filtering |
 | `tracer.py` | 3. Trace (Weight) | Index dependency source, build call graph, BFS from entry points, compute LLOC heft ratio |
+| `transitive.py` | 3.5. Transitive | Usage-driven BFS over the dependency graph (`check --transitive`); ty-style module classification |
 | `reporter.py` | 4. Report (Coconut) | Format results as a `rich` table (or JSON) with recommendations |
 | `treemap.py` | 4. Visualize | Squarified treemap rendering via Rich (`check --treemap`) |
 | `cli.py` | Orchestration | `argparse` CLI, wires phases together for the `check` command |
@@ -120,7 +121,27 @@ otherwise package mode.
 Flags: `--site-packages` (explicit site-packages path),
 `-r`/`--requirements` (explicit requirements file),
 `--treemap` (LLOC treemap visualization),
+`--transitive` (experimental: trace usage through transitive deps),
 `--format table|json`.
+
+## Transitive Dependencies (experimental)
+
+`check --transitive` walks the dependency graph breadth-first from the
+project's used direct deps.
+For each dep, the names activated by the project (or an upstream dep)
+are traced through its call graph; modules containing reached
+definitions are *active*, and only imports in active modules
+(plus ancestor `__init__.py` files) propagate usage downward.
+Imports inside a dep's source are classified ty-style by ordered
+resolution (`classify_module` in `transitive.py`):
+the dep's own import names, then declared `Requires-Dist` import names,
+then `sys.stdlib_module_names`, else unknown.
+Transitive deps that are also declared directly are excluded from the
+transitive report (already in the main report).
+Known limitations: names contributed by parents discovered after a dep
+was processed count toward its heft but do not re-propagate
+(no fixpoint iteration), and transitive usage flowing *into* a direct
+dep does not increase the direct dep's reported heft.
 
 ## Namespace Package Handling
 
