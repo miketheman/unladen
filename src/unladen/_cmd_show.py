@@ -20,6 +20,7 @@ from unladen.merger import (
     detect_dynamic_dispatch,
     merge_dep_usage,
 )
+from unladen.reporter import format_heft_pct, format_lloc
 from unladen.tracer import compute_heft
 
 
@@ -79,8 +80,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     if info["paths"]:
         heft = compute_heft(info["paths"], summary.used_names, dep_name)
         console.print(
-            f"\n[bold]Heft:[/bold] {heft.active_lloc}/{heft.total_lloc} "
-            f"LLOC ({heft.heft_ratio * 100:.1f}%)"
+            f"\n[bold]Heft:[/bold] {format_lloc(heft.active_lloc, heft.total_lloc)} "
+            f"LLOC ({format_heft_pct(heft.heft_ratio)})"
         )
         if heft.opaque_files:
             console.print(f"  {heft.opaque_files} binary extension(s) not analyzed")

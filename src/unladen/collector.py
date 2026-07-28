@@ -25,6 +25,14 @@ _RE_SEPARATOR = re.compile(r"[-_.]+")
 _RE_INLINE_COMMENT = re.compile(r"\s#")
 
 
+class DistributionNotFound(FileNotFoundError):
+    """No dist-info/egg-info for a distribution in site-packages.
+
+    Subclasses FileNotFoundError for backward compatibility, but lets
+    callers distinguish "not installed" from genuine filesystem errors.
+    """
+
+
 class DepInfo(TypedDict):
     """Metadata for a single declared dependency."""
 
@@ -425,7 +433,7 @@ def resolve_installed(
             dist = importlib.metadata.Distribution.at(
                 _find_dist_info(dep_name, site_packages, dist_infos)
             )
-        except FileNotFoundError:
+        except DistributionNotFound:
             # Dependency declared but not installed
             dep_info: DepInfo = {
                 "version": None,
@@ -472,6 +480,25 @@ def resolve_package_info(
     return version, import_names, paths
 
 
+def package_requires(
+    package_name: str,
+    site_packages: Path,
+    index: dict[str, Path] | None = None,
+) -> list[str]:
+    """Read a package's Requires-Dist specs from its installed METADATA.
+
+    Skips extras-only deps (``; extra == "dev"``) since those are
+    optional and not activated by default installation.
+    Raises DistributionNotFound if the package has no dist-info.
+    """
+    dist = importlib.metadata.Distribution.at(
+        _find_dist_info(package_name, site_packages, index)
+    )
+    requires = dist.metadata.get_all("Requires-Dist") or []
+    # Skip extras-only deps: "foo ; extra == 'bar'"
+    return [req for req in requires if "extra ==" not in req and "extra==" not in req]
+
+
 def collect_package_deps(
     package_name: str,
     site_packages: Path,
@@ -481,22 +508,10 @@ def collect_package_deps(
 
     Reads the installed package's METADATA to find its declared
     dependencies, then resolves them in site-packages.
-    Skips extras-only deps (``; extra == "dev"``) since those are
-    optional and not activated by default installation.
     *index* is an optional pre-built dist-info index, passed through
     to name resolution (see ``resolve_installed``).
     """
-    dist = importlib.metadata.Distribution.at(
-        _find_dist_info(package_name, site_packages, index)
-    )
-    requires = dist.metadata.get_all("Requires-Dist") or []
-    specs = []
-    for req in requires:
-        # Skip extras-only deps: "foo ; extra == 'bar'"
-        if "extra ==" in req or "extra==" in req:
-            continue
-        specs.append(req)
-
+    specs = package_requires(package_name, site_packages, index)
     if not specs:
         return {}
     dep_names, markers = _names_and_markers(specs)
@@ -569,7 +584,7 @@ def _find_dist_info(
     try:
         return index[normalized]
     except KeyError:
-        raise FileNotFoundError(f"No dist-info found for {dep_name}") from None
+        raise DistributionNotFound(f"No dist-info found for {dep_name}") from None
 
 
 def _get_import_names(

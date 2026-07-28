@@ -34,6 +34,10 @@ class FuncDef(TypedDict):
     module: str
     owner: NotRequired[str]  # owning class name, present for type="method"
     bases: NotRequired[list[str]]  # base class names, present for type="class"
+    # Source file the definition came from.  Annotated during index
+    # assembly (not in workers, to keep the pickled payload small) so
+    # file-level activation is exact, not module-name-based.
+    path: NotRequired[Path]
 
 
 class DepIndex(TypedDict):
@@ -43,6 +47,7 @@ class DepIndex(TypedDict):
     functions: list[FuncDef]
     opaque_files: int
     call_graph: dict[str, set[str]]
-    # Module name -> source files it was indexed from, so consumers can
-    # map traced modules back to files without re-walking the tree.
-    module_files: dict[str, list[Path]]
+    # All source files the index was built from.  Lets consumers check
+    # file membership (e.g. ancestor __init__.py lookups) without
+    # re-walking the tree or issuing stat calls.
+    files: list[Path]

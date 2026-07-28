@@ -173,7 +173,9 @@ def _cmd_check_project(args, project_path, req_file) -> int:
         from unladen.collector import discover_site_packages
 
         sp = args.site_packages or discover_site_packages(project_path)
-        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp)
+        # Pass the exclusions so excluded deps can't reappear as
+        # transitive deps of a kept dependency.
+        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp, exclude)
 
     if args.output_format == "json":
         print(
@@ -245,7 +247,13 @@ def _cmd_check_package(args, package_name) -> int:
 
     transitive = None
     if args.transitive:
-        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp)
+        from unladen.collector import _normalize_dep_name
+
+        # Exclude the target itself so a dependency cycle back to it
+        # can't list the analyzed package as its own transitive dep.
+        transitive = _trace_transitive_deps(
+            dep_map, dep_summaries, sp, {_normalize_dep_name(package_name)}
+        )
 
     if args.output_format == "json":
         print(render_json(reports, project_lloc=project_lloc, transitive=transitive))
@@ -291,18 +299,20 @@ def _analyze_deps(dep_map, usage):
     return dep_summaries, hefts
 
 
-def _trace_transitive_deps(dep_map, dep_summaries, site_packages):
+def _trace_transitive_deps(dep_map, dep_summaries, site_packages, exclude=frozenset()):
     """Bridge Phase 2.5 output to transitive tracing (``--transitive``).
 
-    Returns [] when site-packages could not be resolved (with a stderr
-    note, so an empty transitive section isn't mistaken for a finding).
+    Returns None when site-packages could not be resolved (with a
+    stderr note), so a skipped analysis stays distinguishable from a
+    genuine empty result — the JSON payload omits the "transitive" key
+    instead of emitting an empty list.
     """
     if site_packages is None:
         print(
             "Warning: could not resolve site-packages; skipping transitive analysis.",
             file=sys.stderr,
         )
-        return []
+        return None
 
     from unladen.transitive import trace_transitive
 
@@ -311,7 +321,7 @@ def _trace_transitive_deps(dep_map, dep_summaries, site_packages):
         for name, summary in dep_summaries.items()
         if summary.used_names
     }
-    return trace_transitive(dep_map, used_map, site_packages)
+    return trace_transitive(dep_map, used_map, site_packages, exclude=exclude)
 
 
 def _render_transitive(console, transitive) -> None:

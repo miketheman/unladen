@@ -97,26 +97,35 @@ simplifications worth revisiting:
   names contributed by later-discovered parents count toward heft
   but do not re-propagate to grandchildren.
 - **Transitive usage into direct deps.**
-  When a dependency's active code uses a dep the project also declares
-  directly, that extra usage is dropped rather than raising the
-  direct dep's heft.  Showing "direct + transitive" heft per dep
-  would give a truer total-activation picture.
+  Usage now propagates *through* direct deps (so their subtrees are
+  discovered), but the extra activation still doesn't raise the
+  direct dep's reported heft.  Showing "direct + transitive" heft
+  per dep would give a truer total-activation picture.
 - **Index reuse with the main report.**
-  Within the transitive pass each dep is now indexed at most once
-  (the index built for active-file tracing is reused for heft),
+  Within the transitive pass each dep is indexed at most once
+  (batch-indexed per BFS level; index and trace reused for heft),
   but *direct* deps are still indexed separately by the main
   report's bulk pass.  Having `compute_hefts_bulk` optionally
-  return its indexes (or active modules) would remove that
-  remaining duplication.
+  return its indexes would remove that remaining duplication.
 - **Single site-packages resolution.**
   Project mode re-runs `discover_site_packages` for `--transitive`
   because `collect_dependencies` discards the path it discovered.
   Threading the resolved path out of Phase 1 would guarantee both
   reports analyze the same environment.
-- **Undeclared imports.**
-  `classify_module` returns `UNKNOWN` for imports that are neither
-  first-party, declared third-party, nor stdlib —
-  surfacing those would flag missing `Requires-Dist` entries.
+- **Parse-once for import extraction.**
+  `inspect_source_files` re-parses a parent's *active* files to find
+  their imports after indexing already parsed them.
+  Extracting imports at index time was considered and rejected for
+  now: the usage walk would then run on *all* files (not just the
+  active subset) and bloat the worker payload, likely a net loss.
+- **Undeclared imports (ty-style classification).**
+  A prototype `classify_module` ordered imports ty-style
+  (first-party, declared third-party, stdlib via
+  `sys.stdlib_module_names`, else unknown) but was removed as dead
+  code: propagation only ever consults declared children's names.
+  Revive the idea where it has a consumer — classifying the imports
+  the inspector actually finds in active files, to flag missing
+  `Requires-Dist` entries (unknown) and backport shadowing (stdlib).
 - **Treemap integration.**
   Transitive deps could render as nested tiles under their parent.
 

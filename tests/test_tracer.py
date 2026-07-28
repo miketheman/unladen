@@ -1752,6 +1752,26 @@ class TestActiveFiles:
         files = active_files(index_dependency([mod]), {"f"}, [mod])
         assert files == [mod]
 
+    def test_same_stem_files_not_conflated(self, tmp_path):
+        """Same-named modules in different subpackages must not activate
+        each other — selection is by definition provenance, not module
+        name (regression: stem-keyed selection propagated phantom
+        imports from unrelated same-stem files)."""
+        pkg = tmp_path / "foo"
+        (pkg / "http").mkdir(parents=True)
+        (pkg / "db").mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "http" / "__init__.py").write_text("")
+        (pkg / "db" / "__init__.py").write_text("")
+        (pkg / "http" / "client.py").write_text("def get_client():\n    return 1\n")
+        (pkg / "db" / "client.py").write_text(
+            "import psycopg\n\ndef connect_db():\n    return psycopg.connect()\n"
+        )
+
+        files = active_files(index_dependency([pkg]), {"get_client"}, [pkg])
+        assert pkg / "http" / "client.py" in files
+        assert pkg / "db" / "client.py" not in files
+
     def test_no_used_names_yields_nothing(self, tmp_path):
         mod = tmp_path / "flat.py"
         mod.write_text("def f():\n    return 1\n")

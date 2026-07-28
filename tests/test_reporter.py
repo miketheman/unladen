@@ -723,3 +723,78 @@ class TestRecommendHybridNative:
             opaque_files=opaque,
         )
         assert recommend(heft) == expected
+
+
+class TestTransitiveRendering:
+    """render_transitive_table shares the main table's display rules."""
+
+    def _render(self, td):
+        import io
+
+        from rich.console import Console
+
+        from unladen.reporter import render_transitive_table
+
+        buf = io.StringIO()
+        console = Console(file=buf, width=120)
+        render_transitive_table([td], console=console)
+        return buf.getvalue()
+
+    def _transitive_dep(self, heft):
+        from unladen.transitive import TransitiveDep
+
+        return TransitiveDep(
+            name="somedep",
+            version="1.0",
+            used_names={"f"},
+            via={"parent"},
+            depth=1,
+            heft=heft,
+        )
+
+    def test_native_extension_dep_shows_na(self):
+        """A compiled-extension transitive dep must render 'n/a', not
+        '0.0%' — same rule as the main table (regression)."""
+        heft = HeftResult(
+            dep_name="somedep",
+            total_lloc=3,
+            active_lloc=0,
+            heft_ratio=0.0,
+            opaque_files=1,
+        )
+        out = self._render(self._transitive_dep(heft))
+        assert "n/a" in out
+        assert "1 extension" in out
+        assert "0.0%" not in out
+
+    def test_regular_dep_shows_ratio(self):
+        heft = HeftResult(
+            dep_name="somedep",
+            total_lloc=100,
+            active_lloc=25,
+            heft_ratio=0.25,
+            opaque_files=0,
+        )
+        out = self._render(self._transitive_dep(heft))
+        assert "25.0%" in out
+        assert "25/100" in out
+
+
+class TestIsNativeHeft:
+    def test_native(self):
+        from unladen.reporter import is_native_heft
+
+        heft = HeftResult("x", 10, 0, 0.0, opaque_files=2)
+        assert is_native_heft(heft)
+
+    def test_hybrid_large_python_not_native(self):
+        from unladen.reporter import is_native_heft
+
+        heft = HeftResult("x", 5000, 100, 0.02, opaque_files=2)
+        assert not is_native_heft(heft)
+
+    def test_pure_python_not_native(self):
+        from unladen.reporter import is_native_heft
+
+        heft = HeftResult("x", 100, 50, 0.5, opaque_files=0)
+        assert not is_native_heft(heft)

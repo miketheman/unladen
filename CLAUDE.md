@@ -129,17 +129,22 @@ Flags: `--site-packages` (explicit site-packages path),
 `check --transitive` walks the dependency graph breadth-first from the
 project's used direct deps.
 For each dep, the names activated by the project (or an upstream dep)
-are traced through its call graph; modules containing reached
-definitions are *active*, and only imports in active modules
-(plus ancestor `__init__.py` files) propagate usage downward.
-A dep's declared import names are classified ty-style by ordered
-resolution (`classify_module` in `transitive.py`):
-the dep's own import names, then declared `Requires-Dist` import names,
-then `sys.stdlib_module_names`, else unknown.
-Only third-party names propagate; stdlib/unknown surfacing is future
-work (see FUTURE.md).
-Transitive deps that are also declared directly are excluded from the
-transitive report (already in the main report).
+are traced through its call graph; files containing reached
+definitions are *active* (per-definition provenance, so same-named
+modules in different subpackages don't activate each other), and only
+imports in active files (plus ancestor `__init__.py` files) propagate
+usage downward via the import names of the dep's declared
+`Requires-Dist` children.
+Namespace-shared top-level names (e.g. `zope.*`) are kept —
+`merge_dep_usage` narrows attribution to each child's owned subpackages.
+Deps also declared directly stay in the main report; usage still
+propagates *through* them (even when the project never imports them
+directly) so their subtrees are discovered.
+`[tool.unladen] exclude` names are neither reported nor traversed,
+and package mode excludes the target itself so dependency cycles
+can't report it as its own transitive dep.
+Parents are batch-indexed per BFS level through one worker pool; the
+index and trace are reused for heft computation.
 Known limitations: names contributed by parents discovered after a dep
 was processed count toward its heft but do not re-propagate
 (no fixpoint iteration), and transitive usage flowing *into* a direct

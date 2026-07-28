@@ -5,12 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from unladen.transitive import (
-    ModuleOrigin,
-    TransitiveDep,
-    classify_module,
-    trace_transitive,
-)
+from unladen.transitive import TransitiveDep, trace_transitive
 
 
 def _make_dist(
@@ -19,15 +14,25 @@ def _make_dist(
     version: str,
     files: dict[str, str],
     requires: list[str] | None = None,
+    top_level: str | None = None,
 ) -> None:
-    """Create a fake installed distribution in *site_packages*."""
+    """Create a fake installed distribution in *site_packages*.
+
+    *top_level* overrides the import name written to top_level.txt
+    (for namespace packages whose import name differs from the
+    distribution name).  A RECORD file listing the distribution's
+    files is always written so namespace ownership can be resolved.
+    """
     dist_info = site_packages / f"{name}-{version}.dist-info"
     dist_info.mkdir(parents=True)
     metadata = ["Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}"]
     for req in requires or []:
         metadata.append(f"Requires-Dist: {req}")
     (dist_info / "METADATA").write_text("\n".join(metadata) + "\n")
-    (dist_info / "top_level.txt").write_text(name + "\n")
+    (dist_info / "top_level.txt").write_text((top_level or name) + "\n")
+    (dist_info / "RECORD").write_text(
+        "\n".join(f"{rel_path},," for rel_path in files) + "\n"
+    )
     for rel_path, content in files.items():
         target = site_packages / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -96,39 +101,6 @@ def _direct_dep_map(sp: Path, names: list[str]) -> dict:
     from unladen.collector import resolve_installed
 
     return resolve_installed(names, sp)
-
-
-class TestClassifyModule:
-    """ty-style ordered module classification."""
-
-    def test_first_party(self):
-        origin = classify_module("spam", {"spam"}, {"eggs"})
-        assert origin is ModuleOrigin.FIRST_PARTY
-
-    def test_third_party(self):
-        origin = classify_module("eggs", {"spam"}, {"eggs"})
-        assert origin is ModuleOrigin.THIRD_PARTY
-
-    def test_stdlib(self):
-        origin = classify_module("os", {"spam"}, {"eggs"})
-        assert origin is ModuleOrigin.STDLIB
-
-    def test_unknown(self):
-        origin = classify_module("mystery", {"spam"}, {"eggs"})
-        assert origin is ModuleOrigin.UNKNOWN
-
-    def test_first_party_wins_over_stdlib(self):
-        # A dep whose own import name shadows a stdlib name (e.g. legacy-cgi
-        # providing "cgi") classifies as first-party, mirroring ty's
-        # search-path priority (project source before stdlib).
-        origin = classify_module("cgi", {"cgi"}, set())
-        assert origin is ModuleOrigin.FIRST_PARTY
-
-    def test_declared_wins_over_stdlib(self):
-        # A declared dependency providing a stdlib-named module
-        # (backport packages) counts as third-party.
-        origin = classify_module("cgi", {"spam"}, {"cgi"})
-        assert origin is ModuleOrigin.THIRD_PARTY
 
 
 class TestTraceTransitive:
@@ -287,6 +259,151 @@ class TestTraceTransitive:
         dep_map = _direct_dep_map(sp, ["spam"])
         result = trace_transitive(dep_map, {"spam": {"breakfast"}}, sp)
         assert result == []
+
+    def test_namespace_shared_top_level_traced(self, tmp_path):
+        """Namespace children sharing the parent's top-level import name
+        must still be traced (zope.component -> zope.interface style);
+        merge_dep_usage narrows attribution to owned subpackages."""
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "ns-component",
+            "1.0",
+            requires=["ns-interface"],
+            top_level="ns",
+            files={
+                "ns/component/__init__.py": (
+                    "from ns.interface import Iface\n"
+                    "\n"
+                    "def register():\n"
+                    "    return Iface()\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp,
+            "ns-interface",
+            "2.0",
+            top_level="ns",
+            files={
+                "ns/interface/__init__.py": (
+                    "class Iface:\n    def provided_by(self):\n        return True\n"
+                ),
+            },
+        )
+        dep_map = _direct_dep_map(sp, ["ns-component"])
+        result = trace_transitive(dep_map, {"ns-component": {"register"}}, sp)
+        interface = next((td for td in result if td.name == "ns-interface"), None)
+        assert interface is not None
+        assert "Iface" in interface.used_names
+
+    def test_excluded_dep_not_reported_or_traversed(self, chain_site_packages):
+        """A [tool.unladen]-excluded dep must not reappear transitively,
+        and usage must not propagate through it."""
+        dep_map = _direct_dep_map(chain_site_packages, ["spam"])
+        result = trace_transitive(
+            dep_map,
+            {"spam": {"breakfast"}},
+            chain_site_packages,
+            exclude={"eggs"},
+        )
+        assert result == []
+
+    def test_excluded_leaf_only(self, chain_site_packages):
+        dep_map = _direct_dep_map(chain_site_packages, ["spam"])
+        result = trace_transitive(
+            dep_map,
+            {"spam": {"breakfast"}},
+            chain_site_packages,
+            exclude={"bacon"},
+        )
+        names = {td.name for td in result}
+        assert names == {"eggs"}
+
+    def test_cycle_back_to_excluded_target(self, tmp_path):
+        """Package mode passes the target as an exclusion so a dependency
+        cycle can't report the analyzed package as its own transitive dep."""
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "applehelp",
+            "1.0",
+            requires=["bigdep"],
+            files={
+                "applehelp/__init__.py": (
+                    "from bigdep import build\n\ndef setup():\n    return build()\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp,
+            "bigdep",
+            "2.0",
+            requires=["applehelp"],
+            files={
+                "bigdep/__init__.py": (
+                    "from applehelp import setup\n\ndef build():\n    return setup()\n"
+                ),
+            },
+        )
+        from unladen.collector import collect_package_deps
+
+        dep_map = collect_package_deps("applehelp", sp)
+        result = trace_transitive(
+            dep_map, {"bigdep": {"build"}}, sp, exclude={"applehelp"}
+        )
+        assert {td.name for td in result} == set()
+
+    def test_unused_direct_dep_still_propagates(self, chain_site_packages):
+        """A declared-but-unused direct dep is not reported transitively,
+        but usage flowing through it must still reach its children."""
+        dep_map = _direct_dep_map(chain_site_packages, ["spam", "eggs"])
+        result = trace_transitive(dep_map, {"spam": {"breakfast"}}, chain_site_packages)
+        names = {td.name for td in result}
+        assert "eggs" not in names  # direct: stays in the main report
+        assert "bacon" in names  # reached through the unused direct dep
+        bacon = next(td for td in result if td.name == "bacon")
+        assert bacon.via == {"eggs"}
+        assert bacon.depth == 2
+
+    def test_late_contribution_recomputes_heft(self, chain_site_packages):
+        """When a later-processed parent adds names to an already-traced
+        dep, heft must reflect the union (stale trace cache is bypassed)."""
+        _make_dist(
+            chain_site_packages,
+            "crumpet",
+            "1.0",
+            requires=["muffin"],
+            files={
+                "crumpet/__init__.py": (
+                    "from muffin import warm\n\ndef tea():\n    return warm()\n"
+                ),
+            },
+        )
+        _make_dist(
+            chain_site_packages,
+            "muffin",
+            "1.0",
+            requires=["eggs"],
+            files={
+                "muffin/__init__.py": (
+                    "from eggs import poach\n\ndef warm():\n    return poach()\n"
+                ),
+            },
+        )
+        dep_map = _direct_dep_map(chain_site_packages, ["spam", "crumpet"])
+        result = trace_transitive(
+            dep_map,
+            {"spam": {"breakfast"}, "crumpet": {"tea"}},
+            chain_site_packages,
+        )
+        eggs = next(td for td in result if td.name == "eggs")
+        # eggs was processed at depth 1 with {scramble}; muffin (depth 2)
+        # added {poach} afterwards.  Heft must count both: scramble(2) +
+        # poach(2) of total 5.
+        assert {"scramble", "poach"} <= eggs.used_names
+        assert eggs.heft is not None
+        assert eggs.heft.active_lloc == 4
 
     def test_to_dict(self, chain_site_packages):
         dep_map = _direct_dep_map(chain_site_packages, ["spam"])

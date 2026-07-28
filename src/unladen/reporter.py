@@ -77,7 +77,7 @@ class DepReport:
             return "-"
         if self.is_native:
             return "n/a"
-        return _format_heft_pct(self.heft)
+        return format_heft_pct(self.heft.heft_ratio)
 
     @property
     def lloc_display(self) -> str:
@@ -85,7 +85,7 @@ class DepReport:
             return "-"
         if self.is_native:
             return _pluralize(self.heft.opaque_files, "extension", "extensions")
-        return _format_lloc(self.heft)
+        return format_lloc(self.heft.active_lloc, self.heft.total_lloc)
 
     @property
     def status(self) -> str:
@@ -164,14 +164,31 @@ class DepReport:
         return d
 
 
-def _format_heft_pct(heft: HeftResult) -> str:
-    """Format a heft ratio as a percentage, shared by all tables."""
-    return f"{heft.heft_ratio * 100:.1f}%"
+def format_heft_pct(ratio: float) -> str:
+    """Format a heft ratio as a percentage.
+
+    Shared by every renderer (check table, transitive table, show).
+    """
+    return f"{ratio * 100:.1f}%"
 
 
-def _format_lloc(heft: HeftResult) -> str:
-    """Format active/total LLOC, shared by all tables."""
-    return f"{heft.active_lloc}/{heft.total_lloc}"
+def format_lloc(active: int, total: int) -> str:
+    """Format active/total LLOC.
+
+    Takes plain ints so non-HeftResult carriers (e.g. treemap tiles)
+    can share the format.
+    """
+    return f"{active}/{total}"
+
+
+def is_native_heft(heft: HeftResult) -> bool:
+    """True when a dep is primarily native code.
+
+    Compiled extensions with little Python mean the LLOC ratio does
+    not describe the dependency; renderers show "n/a" instead.
+    Mirrors the KEEP_NATIVE branch of ``recommend()``.
+    """
+    return heft.opaque_files > 0 and heft.total_lloc < MASS_THRESHOLD
 
 
 def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
@@ -215,10 +232,10 @@ def recommend(heft: HeftResult) -> Recommendation:
     carries mass the LLOC analysis cannot see, so a low Python ratio
     cannot justify inlining advice.  They cap at Review.
     """
-    if heft.opaque_files:
+    if is_native_heft(heft):
         # Primarily native: little Python to analyze
-        if heft.total_lloc < MASS_THRESHOLD:
-            return Recommendation.KEEP_NATIVE
+        return Recommendation.KEEP_NATIVE
+    if heft.opaque_files:
         # Hybrid native: ratio only describes the Python portion
         if heft.heft_ratio > 0.25:
             return Recommendation.KEEP
@@ -382,9 +399,14 @@ def render_transitive_table(
     for td in transitive:
         if td.heft is None:
             heft_pct, lloc = "-", "-"
+        elif is_native_heft(td.heft):
+            # Same rule as the main table: LLOC ratios don't describe
+            # compiled extensions, so don't render "0.0%" for them.
+            heft_pct = "n/a"
+            lloc = _pluralize(td.heft.opaque_files, "extension", "extensions")
         else:
-            heft_pct = _format_heft_pct(td.heft)
-            lloc = _format_lloc(td.heft)
+            heft_pct = format_heft_pct(td.heft.heft_ratio)
+            lloc = format_lloc(td.heft.active_lloc, td.heft.total_lloc)
         table.add_row(
             td.name,
             td.version or "-",
