@@ -4,12 +4,18 @@ Functions used by both the ``check`` and ``show`` commands
 to load project configuration and resolve dependency maps.
 """
 
+from __future__ import annotations
+
 import sys
 import tomllib
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from unladen.collector import DepInfo
 
 
-def load_config(project_path: Path) -> dict:
+def load_config(project_path: Path) -> dict[str, Any]:
     """Load ``[tool.unladen]`` configuration from pyproject.toml.
 
     Returns an empty dict if pyproject.toml is missing or has no
@@ -38,7 +44,7 @@ def load_dep_map(
     project_path: Path,
     req_file: str | None,
     site_packages: Path | None = None,
-):
+) -> dict[str, DepInfo] | None:
     """Load dependency map, returning None on error.
 
     Handles missing project paths, missing dependency files

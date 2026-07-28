@@ -5,13 +5,28 @@ Heavy imports (collector, inspector, tracer, reporter) are deferred to
 the command functions to keep ``unladen --help`` fast.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import site
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
 
 from unladen._config import load_dep_map, load_exclude_set
+
+if TYPE_CHECKING:
+    # Type-only imports: the heavy modules stay lazily imported at
+    # runtime (see module docstring), but signatures are fully checked.
+    from rich.console import Console
+
+    from unladen._types import HeftResult
+    from unladen.collector import DepInfo
+    from unladen.inspector import UsageEntry
+    from unladen.merger import DepUsageSummary
+    from unladen.reporter import DepReport, Recommendation
+    from unladen.transitive import TransitiveDep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,16 +137,17 @@ def _cmd_check(args: argparse.Namespace) -> int:
     - **Project mode**: ``unladen check /path/to/project``
     - **Package mode**: ``unladen check requests``
     """
-    project_path, req_file, package_name = _resolve_check_target(args)
-    if project_path is None and package_name is None:
+    target = _resolve_check_target(args)
+    if target.package_name is not None:
+        return _cmd_check_package(args, target.package_name)
+    if target.project_path is None:
         return 1  # error already printed
-
-    if package_name:
-        return _cmd_check_package(args, package_name)
-    return _cmd_check_project(args, project_path, req_file)
+    return _cmd_check_project(args, target.project_path, target.req_file)
 
 
-def _cmd_check_project(args, project_path, req_file) -> int:
+def _cmd_check_project(
+    args: argparse.Namespace, project_path: Path, req_file: str | None
+) -> int:
     """Check a project directory's dependency usage."""
     from unladen.collector import _normalize_dep_name
     from unladen.inspector import find_project_source, inspect_source_files_counted
@@ -204,7 +220,7 @@ def _cmd_check_project(args, project_path, req_file) -> int:
     return 0
 
 
-def _cmd_check_package(args, package_name) -> int:
+def _cmd_check_package(args: argparse.Namespace, package_name: str) -> int:
     """Check an installed package's dependency usage."""
 
     from unladen.collector import collect_package_deps, resolve_package_info
@@ -277,17 +293,19 @@ def _cmd_check_package(args, package_name) -> int:
     return 0
 
 
-def _analyze_deps(dep_map, usage):
+def _analyze_deps(
+    dep_map: dict[str, DepInfo], usage: dict[str, UsageEntry]
+) -> tuple[dict[str, DepUsageSummary], dict[str, HeftResult]]:
     """Bridge Phase 2 (inspector) to Phase 3 (tracer).
 
     Merges per-import-name usage into per-dep summaries,
     then computes heft ratios for all used deps in a single bulk pass.
     """
-    from unladen.merger import DepUsageSummary, merge_dep_usage
+    from unladen.merger import merge_dep_usage
     from unladen.tracer import compute_hefts_bulk
 
     dep_summaries: dict[str, DepUsageSummary] = {}
-    heft_work: list[tuple[str, list, set[str]]] = []
+    heft_work: list[tuple[str, list[Path], set[str]]] = []
 
     for name, info in dep_map.items():
         summary = merge_dep_usage(info["import_names"], usage, info["paths"])
@@ -299,7 +317,12 @@ def _analyze_deps(dep_map, usage):
     return dep_summaries, hefts
 
 
-def _trace_transitive_deps(dep_map, dep_summaries, site_packages, exclude=frozenset()):
+def _trace_transitive_deps(
+    dep_map: dict[str, DepInfo],
+    dep_summaries: dict[str, DepUsageSummary],
+    site_packages: Path | None,
+    exclude: frozenset[str] | set[str] = frozenset(),
+) -> list[TransitiveDep] | None:
     """Bridge Phase 2.5 output to transitive tracing (``--transitive``).
 
     Returns None when site-packages could not be resolved (with a
@@ -324,7 +347,7 @@ def _trace_transitive_deps(dep_map, dep_summaries, site_packages, exclude=frozen
     return trace_transitive(dep_map, used_map, site_packages, exclude=exclude)
 
 
-def _render_transitive(console, transitive) -> None:
+def _render_transitive(console: Console, transitive: list[TransitiveDep]) -> None:
     """Render the transitive table after the main report."""
     from unladen.reporter import render_transitive_table
 
@@ -371,11 +394,15 @@ def _collect_py_files(source_paths: list[Path]) -> list[Path]:
     return py_files
 
 
-def _build_reports(dep_map, dep_summaries, hefts):
+def _build_reports(
+    dep_map: dict[str, DepInfo],
+    dep_summaries: dict[str, DepUsageSummary],
+    hefts: dict[str, HeftResult],
+) -> list[DepReport]:
     """Build DepReport objects from analysis results."""
     from unladen.reporter import DepReport
 
-    reports = []
+    reports: list[DepReport] = []
     for name, info in dep_map.items():
         summary = dep_summaries[name]
         heft, rec = _classify_dep(name, info, summary, hefts)
@@ -398,7 +425,12 @@ def _build_reports(dep_map, dep_summaries, hefts):
     return reports
 
 
-def _classify_dep(name, info, summary, hefts):
+def _classify_dep(
+    name: str,
+    info: DepInfo,
+    summary: DepUsageSummary,
+    hefts: dict[str, HeftResult],
+) -> tuple[HeftResult | None, Recommendation | None]:
     """Classify a dependency into one of four states.
 
     Returns (heft, recommendation) based on:
@@ -427,8 +459,11 @@ def _treemap_title(excluded_count: int = 0) -> str:
 
 
 def _render_treemap_from_reports(
-    console, reports, project_lloc=0, title="LLOC Treemap"
-):
+    console: Console,
+    reports: list[DepReport],
+    project_lloc: int = 0,
+    title: str = "LLOC Treemap",
+) -> None:
     """Render the LLOC treemap from report objects."""
     from unladen.treemap import TileData, Treemap
 
@@ -447,18 +482,27 @@ def _render_treemap_from_reports(
         console.print(Treemap(tiles, project_lloc=project_lloc, title=title))
 
 
-def _resolve_check_target(args: argparse.Namespace):
-    """Determine whether the check target is a directory or package name.
+class CheckTarget(NamedTuple):
+    """Resolved ``check`` target.
 
-    Returns (project_path, req_file, package_name) where either
-    project_path or package_name is set, not both.
+    At most one of *project_path* / *package_name* is set; both None
+    means an error was already printed.  *req_file* only accompanies
+    project mode.
     """
+
+    project_path: Path | None
+    req_file: str | None
+    package_name: str | None
+
+
+def _resolve_check_target(args: argparse.Namespace) -> CheckTarget:
+    """Determine whether the check target is a directory or package name."""
     target = args.target
     req_file = str(Path(args.requirements).resolve()) if args.requirements else None
     target_path = Path(target).resolve()
 
     if target_path.is_dir():
-        return target_path, req_file, None
+        return CheckTarget(target_path, req_file, None)
 
     # Not a directory — treat as a package name
     if req_file:
@@ -466,8 +510,8 @@ def _resolve_check_target(args: argparse.Namespace):
             "Error: -r/--requirements is not supported in package mode.",
             file=sys.stderr,
         )
-        return None, None, None
-    return None, None, target
+        return CheckTarget(None, None, None)
+    return CheckTarget(None, None, target)
 
 
 def _get_version() -> str:

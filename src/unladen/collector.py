@@ -249,7 +249,7 @@ def _parse_setup_py(setup_path: Path) -> list[str]:
     return []
 
 
-def _collect_list_variables(tree) -> dict[str, list[str]]:
+def _collect_list_variables(tree: ast.Module) -> dict[str, list[str]]:
     """Collect top-level variable assignments of string lists."""
 
     variables: dict[str, list[str]] = {}
@@ -264,7 +264,7 @@ def _collect_list_variables(tree) -> dict[str, list[str]]:
 
 
 def _resolve_setup_list_kwarg(
-    tree, kwarg_name: str, variables: dict[str, list[str]]
+    tree: ast.Module, kwarg_name: str, variables: dict[str, list[str]]
 ) -> list[str] | None:
     """Find a setup() keyword argument and resolve it to a string list."""
 
@@ -365,7 +365,7 @@ def _parse_requirements_txt(
     return deps
 
 
-def _extract_string_list(node) -> list[str] | None:
+def _extract_string_list(node: ast.List) -> list[str] | None:
     """Extract a list of constant strings from an ast.List node."""
 
     strings = []

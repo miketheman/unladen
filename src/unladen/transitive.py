@@ -23,7 +23,7 @@ discovered, but their own reported heft is unchanged (see FUTURE.md).
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from unladen._types import DepIndex, HeftResult
 from unladen.collector import (
@@ -45,6 +45,25 @@ from unladen.tracer import (
     index_dependencies_bulk,
     trace_index,
 )
+
+
+class _PendingChild(NamedTuple):
+    """A child dependency discovered during one BFS level."""
+
+    info: DepInfo
+    used_names: set[str]
+    via: set[str]
+
+
+class _CachedTrace(NamedTuple):
+    """A parent's BFS trace with the used-name snapshot it was run for.
+
+    The heft pass reuses the trace only when the snapshot still matches
+    the dep's final used names (no later parent contributed more).
+    """
+
+    used_snapshot: frozenset[str]
+    trace: TraceResult
 
 
 @dataclass
@@ -109,7 +128,7 @@ def trace_transitive(
     # (each distribution's metadata read once), and the dist-info
     # directory listing (built once).
     indexes: dict[str, DepIndex] = {}
-    traces: dict[str, tuple[frozenset[str], TraceResult]] = {}
+    traces: dict[str, _CachedTrace] = {}
     info_cache: dict[str, DepInfo] = dict(dep_map)
     dist_index = _dist_info_index(site_packages)
 
@@ -144,8 +163,8 @@ def trace_transitive(
             )
         )
 
-        # One record per child discovered this level: (info, used, via).
-        pending: dict[str, tuple[DepInfo, set[str], set[str]]] = {}
+        # One record per child discovered this level.
+        pending: dict[str, _PendingChild] = {}
         for name, info, used in frontier:
             if name not in prep:
                 continue
@@ -154,38 +173,42 @@ def trace_transitive(
                 name, used, children, known, indexes[name], info["paths"], traces
             ):
                 if child_name in pending:
-                    _, prev_used, prev_via = pending[child_name]
-                    prev_used.update(child_used)
-                    prev_via.add(name)
+                    prev = pending[child_name]
+                    prev.used_names.update(child_used)
+                    prev.via.add(name)
                 else:
-                    pending[child_name] = (child_info, child_used, {name})
+                    pending[child_name] = _PendingChild(child_info, child_used, {name})
 
         next_frontier: list[tuple[str, DepInfo, set[str]]] = []
-        for child_name, (info, used_names, via) in pending.items():
+        for child_name, child in pending.items():
             if child_name in exclude:
                 continue
             if child_name in direct:
                 # Not reported here (it's in the main report), but usage
                 # still flows through it so its subtree is discovered —
                 # even when the project itself never imports it.
-                if child_name not in processed and info["installed"] and info["paths"]:
+                if (
+                    child_name not in processed
+                    and child.info["installed"]
+                    and child.info["paths"]
+                ):
                     processed.add(child_name)
-                    next_frontier.append((child_name, info, used_names))
+                    next_frontier.append((child_name, child.info, child.used_names))
                 continue
             if child_name in found:
-                found[child_name].used_names.update(used_names)
-                found[child_name].via.update(via)
+                found[child_name].used_names.update(child.used_names)
+                found[child_name].via.update(child.via)
                 continue
             td = TransitiveDep(
                 name=child_name,
-                version=info["version"],
-                used_names=used_names,
-                via=via,
+                version=child.info["version"],
+                used_names=child.used_names,
+                via=child.via,
                 depth=depth,
             )
             found[child_name] = td
-            paths[child_name] = info["paths"]
-            next_frontier.append((child_name, info, td.used_names))
+            paths[child_name] = child.info["paths"]
+            next_frontier.append((child_name, child.info, td.used_names))
         frontier = next_frontier
 
     _attach_hefts(found, indexes, traces, paths)
@@ -227,7 +250,7 @@ def _propagate(
     known: set[str],
     index: DepIndex,
     dep_paths: list[Path],
-    traces: dict[str, tuple[frozenset[str], TraceResult]],
+    traces: dict[str, _CachedTrace],
 ) -> list[tuple[str, DepInfo, set[str]]]:
     """Find which names *name*'s active code uses from its children.
 
@@ -236,7 +259,7 @@ def _propagate(
     cached in *traces* so the heft pass can reuse it.
     """
     trace = trace_index(index, used)
-    traces[name] = (frozenset(used), trace)
+    traces[name] = _CachedTrace(frozenset(used), trace)
     files = files_from_trace(index, trace, dep_paths)
     if not files:
         return []
@@ -257,7 +280,7 @@ def _propagate(
 def _attach_hefts(
     found: dict[str, TransitiveDep],
     indexes: dict[str, DepIndex],
-    traces: dict[str, tuple[frozenset[str], TraceResult]],
+    traces: dict[str, _CachedTrace],
     paths: dict[str, list[Path]],
 ) -> None:
     """Compute heft for each discovered transitive dep.
@@ -274,8 +297,8 @@ def _attach_hefts(
         index = indexes.get(name)
         if index is not None:
             cached = traces.get(name)
-            if cached is not None and cached[0] == td.used_names:
-                td.heft = heft_from_trace(index, cached[1], name)
+            if cached is not None and cached.used_snapshot == td.used_names:
+                td.heft = heft_from_trace(index, cached.trace, name)
             else:
                 td.heft = heft_from_index(index, td.used_names, name)
         elif paths.get(name):
