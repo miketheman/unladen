@@ -765,7 +765,11 @@ class TestTransitiveRendering:
         out = self._render(self._transitive_dep(heft))
         assert "n/a" in out
         assert "1 extension" in out
-        assert "0.0%" not in out
+        assert "Native" in out
+        # The dep's row must not show a ratio (the summary footer
+        # legitimately aggregates LLOC, so check the row only).
+        row = next(line for line in out.splitlines() if "somedep" in line)
+        assert "0.0%" not in row
 
     def test_regular_dep_shows_ratio(self):
         heft = HeftResult(
@@ -778,6 +782,67 @@ class TestTransitiveRendering:
         out = self._render(self._transitive_dep(heft))
         assert "25.0%" in out
         assert "25/100" in out
+
+    def test_sorted_heaviest_first(self):
+        """Rows order by total LLOC so heavy deps surface at the top."""
+        import io
+
+        from rich.console import Console
+
+        from unladen.reporter import render_transitive_table
+        from unladen.transitive import TransitiveDep
+
+        light = TransitiveDep(
+            name="aaa-light",
+            version="1.0",
+            used_names={"f"},
+            via={"parent"},
+            depth=1,
+            heft=HeftResult("aaa-light", 50, 25, 0.5, 0),
+        )
+        heavy = TransitiveDep(
+            name="zzz-heavy",
+            version="1.0",
+            used_names={"g"},
+            via={"parent"},
+            depth=1,
+            heft=HeftResult("zzz-heavy", 9000, 45, 0.005, 0),
+        )
+        buf = io.StringIO()
+        console = Console(file=buf, width=120)
+        render_transitive_table([light, heavy], console=console)
+        out = buf.getvalue()
+        assert out.index("zzz-heavy") < out.index("aaa-light")
+
+    def test_summary_footer(self):
+        heft = HeftResult("somedep", 100, 25, 0.25, 0)
+        out = self._render(self._transitive_dep(heft))
+        assert "1 transitive dependency via 1 parent" in out
+        assert "25/100 LLOC activated (25.0%)" in out
+
+
+class TestTransitiveSignal:
+    @pytest.mark.parametrize(
+        ("total", "active", "ratio", "opaque", "label"),
+        [
+            (1000, 300, 0.30, 0, "Well used"),
+            (1000, 100, 0.10, 0, "Partially used"),
+            (1000, 30, 0.03, 0, "Barely used"),
+            (5000, 10, 0.002, 0, "Dead weight"),
+            (100, 10, 0.10, 2, "Native"),
+            (5000, 1500, 0.30, 2, "Well used"),  # hybrid native
+        ],
+    )
+    def test_signal_labels(self, total, active, ratio, opaque, label):
+        from unladen.reporter import _transitive_signal
+
+        heft = HeftResult("x", total, active, ratio, opaque_files=opaque)
+        assert _transitive_signal(heft)[0] == label
+
+    def test_no_heft_is_dim_dash(self):
+        from unladen.reporter import _transitive_signal
+
+        assert _transitive_signal(None) == ("-", "dim")
 
 
 class TestIsNativeHeft:

@@ -368,6 +368,32 @@ def render_table(
         )
 
 
+# Utilization signals for transitive deps: same thresholds as
+# recommend(), relabeled because the action target is the parent
+# shown in "Via", not the dep itself (which can't be removed directly).
+_TRANSITIVE_SIGNALS = {
+    Recommendation.KEEP: ("Well used", "green"),
+    Recommendation.KEEP_NATIVE: ("Native", "green"),
+    Recommendation.REVIEW: ("Partially used", "yellow"),
+    Recommendation.VENDOR: ("Barely used", "cyan"),
+    Recommendation.REWRITE: ("Dead weight", "red"),
+    Recommendation.REMOVE: ("Unused", "magenta"),
+}
+
+
+def _transitive_signal(heft: HeftResult | None) -> tuple[str, str]:
+    """Map a transitive dep's heft to a (label, style) utilization signal.
+
+    Reuses ``recommend()``'s thresholds so the transitive table's colors
+    stay consistent with the main report.  "Dead weight" (red) marks the
+    actionable rows: a heavy dependency dragged in by its "Via" parent
+    but barely activated by the project's usage.
+    """
+    if heft is None:
+        return "-", "dim"
+    return _TRANSITIVE_SIGNALS[recommend(heft)]
+
+
 def render_transitive_table(
     transitive: list[TransitiveDep],
     *,
@@ -375,8 +401,11 @@ def render_transitive_table(
 ) -> None:
     """Render transitive dependency usage as a rich table.
 
-    No recommendation column: a transitive dep cannot be removed
-    directly — its presence is decided by the parent shown in "Via".
+    Rows sort heaviest-first (total LLOC) so the deps worth attention
+    surface at the top.  The Utilization column colors each dep by the
+    main report's heft thresholds; acting on a row means acting on its
+    "Via" parent.  A dim footer summarizes the total transitive
+    footprint.
     """
     if not transitive:
         console.print(
@@ -395,8 +424,15 @@ def render_transitive_table(
     table.add_column("Names\nUsed", justify="right")
     table.add_column("Heft %", justify="right")
     table.add_column("LLOC\n(active/total)", justify="right")
+    table.add_column("Utilization")
 
-    for td in transitive:
+    # Heaviest first; rows without heft data sort last.
+    ordered = sorted(
+        transitive,
+        key=lambda td: (-(td.heft.total_lloc) if td.heft else 1, td.name),
+    )
+    for td in ordered:
+        label, style = _transitive_signal(td.heft)
         if td.heft is None:
             heft_pct, lloc = "-", "-"
         elif is_native_heft(td.heft):
@@ -413,8 +449,28 @@ def render_transitive_table(
             ", ".join(sorted(td.via)),
             str(td.depth),
             str(len(td.used_names)),
-            heft_pct,
+            f"[{style}]{heft_pct}[/{style}]",
             lloc,
+            f"[{style}]{label}[/{style}]",
         )
 
     console.print(table)
+    _print_transitive_summary(console, transitive)
+
+
+def _print_transitive_summary(
+    console: Console, transitive: list[TransitiveDep]
+) -> None:
+    """Print a one-line footprint summary under the transitive table."""
+    with_heft = [td.heft for td in transitive if td.heft is not None]
+    total = sum(h.total_lloc for h in with_heft)
+    active = sum(h.active_lloc for h in with_heft)
+    parents = {parent for td in transitive for parent in td.via}
+    count = _pluralize(
+        len(transitive), "transitive dependency", "transitive dependencies"
+    )
+    line = f"{count} via {_pluralize(len(parents), 'parent')}"
+    if total:
+        pct = format_heft_pct(active / total)
+        line += f" — {format_lloc(active, total)} LLOC activated ({pct})"
+    console.print(f"[dim]{line}[/dim]")

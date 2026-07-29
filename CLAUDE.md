@@ -145,6 +145,9 @@ and package mode excludes the target itself so dependency cycles
 can't report it as its own transitive dep.
 Parents are batch-indexed per BFS level through one worker pool; the
 index and trace are reused for heft computation.
+The transitive table sorts heaviest-first and colors a Utilization
+signal ("Well used" ... "Dead weight") using `recommend()`'s
+thresholds — the action target for a row is its "Via" parent.
 Known limitations: names contributed by parents discovered after a dep
 was processed count toward its heft but do not re-propagate
 (no fixpoint iteration), and transitive usage flowing *into* a direct
