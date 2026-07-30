@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from unladen._lloc import count_statements as _count_statements
+from unladen._lloc import is_type_checking_block as _is_type_checking_block
 from unladen._parsing import is_setup_call as _is_setup_call
 from unladen._parsing import parse_file as _parse_file
 
@@ -60,6 +61,25 @@ _WALK_HANDLED_TYPES = frozenset(
 )
 
 
+def _type_checking_ranges(tree: ast.Module) -> list[tuple[int, int]]:
+    """Line ranges of top-level ``if TYPE_CHECKING:`` blocks.
+
+    Used to exclude typing-only imports from usage when the caller
+    asks for runtime-only activation (transitive tracing).  Only
+    module-level blocks are considered — the overwhelmingly common
+    placement.
+    """
+    return [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.iter_child_nodes(tree)
+        if isinstance(node, ast.If) and _is_type_checking_block(node)
+    ]
+
+
+def _in_ranges(lineno: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= lineno <= end for start, end in ranges)
+
+
 def _walk_source_file(
     tree: ast.Module,
     file_path: Path,
@@ -67,12 +87,15 @@ def _walk_source_file(
     out_imports: list[ImportInfo],
     out_accesses: dict[str, set[str]],
     out_string_refs: dict[str, list[StringRef]],
+    skip_ranges: list[tuple[int, int]] | None = None,
 ) -> None:
     """Single-pass AST walk extracting imports, accesses, and string refs.
 
     Combines what would be three separate walks (imports, attribute
     accesses, string references) into one pass for performance.
     Results are appended to the caller's mutable output containers.
+    Imports whose line falls in *skip_ranges* (``if TYPE_CHECKING:``
+    blocks) are ignored.
     """
     for node in ast.walk(tree):
         # ast.parse() never yields subclasses, so a frozenset membership
@@ -115,6 +138,8 @@ def _walk_source_file(
                 out_accesses.setdefault(root, set()).add(mid)
                 out_accesses.setdefault(mid, set()).add(node.attr)
         elif isinstance(node, ast.Import):
+            if skip_ranges and _in_ranges(node.lineno, skip_ranges):
+                continue
             for alias in node.names:
                 out_imports.append(
                     ImportInfo(
@@ -127,6 +152,8 @@ def _walk_source_file(
                 )
         elif isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
+                continue
+            if skip_ranges and _in_ranges(node.lineno, skip_ranges):
                 continue
             module = node.module or ""
             for alias in node.names:
@@ -384,20 +411,29 @@ def inspect_project(
 def inspect_source_files(
     source_files: list[Path],
     known_import_names: set[str],
+    *,
+    runtime_only: bool = False,
 ) -> dict[str, UsageEntry]:
     """Inspect explicit source files for dependency usage.
 
     Extracted from ``inspect_project`` to support package mode,
     where source files are already known (from the installed
     package's source paths) and don't need project discovery.
+    With *runtime_only*, imports inside ``if TYPE_CHECKING:`` blocks
+    are excluded — used by transitive tracing, where a typing-only
+    import must not count as runtime activation.
     """
-    usage, _ = inspect_source_files_counted(source_files, known_import_names)
+    usage, _ = inspect_source_files_counted(
+        source_files, known_import_names, runtime_only=runtime_only
+    )
     return usage
 
 
 def inspect_source_files_counted(
     source_files: list[Path],
     known_import_names: set[str],
+    *,
+    runtime_only: bool = False,
 ) -> tuple[dict[str, UsageEntry], int]:
     """Inspect source files and count their total LLOC in one parse pass.
 
@@ -419,6 +455,7 @@ def inspect_source_files_counted(
             warnings.warn(f"Could not parse {f}, skipping", stacklevel=2)
             continue
         total_lloc += _count_statements(tree)
+        skip_ranges = _type_checking_ranges(tree) if runtime_only else None
         _walk_source_file(
             tree,
             f,
@@ -426,6 +463,7 @@ def inspect_source_files_counted(
             all_imports,
             all_attr_accesses,
             all_string_refs,
+            skip_ranges,
         )
 
     usage = _resolve_imports(all_imports, all_attr_accesses, known_import_names)

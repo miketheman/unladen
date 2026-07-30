@@ -16,10 +16,11 @@ from unladen.tracer import (
     _resolve_call_target,
     _resolve_name,
     _TracerIndex,
-    active_files,
     compute_heft,
     compute_hefts_bulk,
+    files_from_trace,
     index_dependency,
+    trace_index,
 )
 
 
@@ -1710,8 +1711,13 @@ class TestConditionalBlockCallGraph:
         assert "loader" in calls.get("HANDLERS", set())
 
 
+def _active_files(index, used_names, dep_paths):
+    """Test helper: the composition production code uses."""
+    return files_from_trace(index, trace_index(index, used_names), dep_paths)
+
+
 class TestActiveFiles:
-    """active_files: map traced usage back to activated source files."""
+    """files_from_trace: map traced usage back to activated source files."""
 
     def test_active_file_and_ancestor_inits(self, tmp_path):
         """Activating a submodule also activates ancestor __init__.py
@@ -1722,7 +1728,7 @@ class TestActiveFiles:
         (pkg / "core.py").write_text("def breakfast():\n    return 1\n")
         (pkg / "unused.py").write_text("def lunch():\n    return 2\n")
 
-        files = active_files(index_dependency([pkg]), {"breakfast"}, [pkg])
+        files = _active_files(index_dependency([pkg]), {"breakfast"}, [pkg])
         assert pkg / "core.py" in files
         assert pkg / "__init__.py" in files
         assert pkg / "unused.py" not in files
@@ -1739,7 +1745,7 @@ class TestActiveFiles:
         (pkg / "sub" / "deep.py").write_text("def f():\n    return 1\n")
         (pkg / "nsdir" / "mod.py").write_text("def g():\n    return 2\n")
 
-        files = active_files(index_dependency([pkg]), {"f", "g"}, [pkg])
+        files = _active_files(index_dependency([pkg]), {"f", "g"}, [pkg])
         assert pkg / "sub" / "deep.py" in files
         assert pkg / "sub" / "__init__.py" in files
         assert pkg / "__init__.py" in files
@@ -1749,7 +1755,7 @@ class TestActiveFiles:
         """A single-file module dep has no package root to walk."""
         mod = tmp_path / "flat.py"
         mod.write_text("def f():\n    return 1\n")
-        files = active_files(index_dependency([mod]), {"f"}, [mod])
+        files = _active_files(index_dependency([mod]), {"f"}, [mod])
         assert files == [mod]
 
     def test_same_stem_files_not_conflated(self, tmp_path):
@@ -1768,11 +1774,11 @@ class TestActiveFiles:
             "import psycopg\n\ndef connect_db():\n    return psycopg.connect()\n"
         )
 
-        files = active_files(index_dependency([pkg]), {"get_client"}, [pkg])
+        files = _active_files(index_dependency([pkg]), {"get_client"}, [pkg])
         assert pkg / "http" / "client.py" in files
         assert pkg / "db" / "client.py" not in files
 
     def test_no_used_names_yields_nothing(self, tmp_path):
         mod = tmp_path / "flat.py"
         mod.write_text("def f():\n    return 1\n")
-        assert active_files(index_dependency([mod]), set(), [mod]) == []
+        assert _active_files(index_dependency([mod]), set(), [mod]) == []

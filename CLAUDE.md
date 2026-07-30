@@ -126,32 +126,38 @@ Flags: `--site-packages` (explicit site-packages path),
 
 ## Transitive Dependencies (experimental)
 
-`check --transitive` walks the dependency graph breadth-first from the
-project's used direct deps.
-For each dep, the names activated by the project (or an upstream dep)
-are traced through its call graph; files containing reached
-definitions are *active* (per-definition provenance, so same-named
-modules in different subpackages don't activate each other), and only
-imports in active files (plus ancestor `__init__.py` files) propagate
-usage downward via the import names of the dep's declared
-`Requires-Dist` children.
-Namespace-shared top-level names (e.g. `zope.*`) are kept —
-`merge_dep_usage` narrows attribution to each child's owned subpackages.
+`check --transitive` walks the dependency graph from the project's
+used direct deps with a fixpoint worklist:
+when a later-discovered parent contributes new names to an
+already-processed dep, that dep is re-enqueued and re-propagated,
+so heft and subtree discovery are independent of traversal order.
+For each dep, the activated names are traced through its call graph;
+files containing reached definitions are *active* (file provenance
+per definition, so same-named modules in different subpackages don't
+activate each other), and only runtime imports in active files
+(`if TYPE_CHECKING:` imports excluded) propagate usage via the import
+names of the dep's declared `Requires-Dist` children.
+A child counts as activated only when imports narrowed to its *owned*
+subpackages match (`DepUsageSummary.is_used`) — namespace-shared
+top-level names (e.g. `zope.*`) are kept without letting a parent's
+self-imports activate its siblings.
 Deps also declared directly stay in the main report; usage still
 propagates *through* them (even when the project never imports them
 directly) so their subtrees are discovered.
 `[tool.unladen] exclude` names are neither reported nor traversed,
 and package mode excludes the target itself so dependency cycles
 can't report it as its own transitive dep.
-Parents are batch-indexed per BFS level through one worker pool; the
-index and trace are reused for heft computation.
+The analysis is seeded with the indexes and traces the main report
+already computed (direct deps are never re-indexed); worklist rounds
+batch-index new parents through one shared, process-lifetime worker
+pool.
 The transitive table sorts heaviest-first and colors a Utilization
 signal ("Well used" ... "Dead weight") using `recommend()`'s
 thresholds — the action target for a row is its "Via" parent.
-Known limitations: names contributed by parents discovered after a dep
-was processed count toward its heft but do not re-propagate
-(no fixpoint iteration), and transitive usage flowing *into* a direct
-dep does not increase the direct dep's reported heft.
+Known limitations: transitive usage flowing *into* a direct dep does
+not increase the direct dep's reported heft, and matching is by bare
+name, so two same-named definitions both activate (see FUTURE.md,
+"Definition-level activation precision").
 
 ## Namespace Package Handling
 

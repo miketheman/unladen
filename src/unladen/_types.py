@@ -47,7 +47,8 @@ class DepIndex(TypedDict):
     functions: list[FuncDef]
     opaque_files: int
     call_graph: dict[str, set[str]]
-    # All source files the index was built from.  Lets consumers check
-    # file membership (e.g. ancestor __init__.py lookups) without
-    # re-walking the tree or issuing stat calls.
+    # Source files successfully parsed into the index.  Lets consumers
+    # check file membership (e.g. ancestor __init__.py lookups) without
+    # re-walking the tree or issuing stat calls; unparseable files are
+    # excluded so they are never selected as active.
     files: list[Path]

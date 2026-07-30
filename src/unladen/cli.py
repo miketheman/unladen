@@ -21,11 +21,12 @@ if TYPE_CHECKING:
     # runtime (see module docstring), but signatures are fully checked.
     from rich.console import Console
 
-    from unladen._types import HeftResult
+    from unladen._types import DepIndex, HeftResult
     from unladen.collector import DepInfo
     from unladen.inspector import UsageEntry
     from unladen.merger import DepUsageSummary
     from unladen.reporter import DepReport, Recommendation
+    from unladen.tracer import TraceResult
     from unladen.transitive import TransitiveDep
 
 
@@ -151,11 +152,11 @@ def _cmd_check_project(
     """Check a project directory's dependency usage."""
     from unladen.collector import _normalize_dep_name
     from unladen.inspector import find_project_source, inspect_source_files_counted
-    from unladen.reporter import render_json, render_table
 
-    dep_map = load_dep_map(project_path, req_file, args.site_packages)
-    if dep_map is None:
+    loaded = load_dep_map(project_path, req_file, args.site_packages)
+    if loaded is None:
         return 1
+    dep_map, sp = loaded
     if not dep_map:
         print("No dependencies found.")
         return 0
@@ -180,52 +181,38 @@ def _cmd_check_project(
             file=sys.stderr,
         )
     usage, project_lloc = inspect_source_files_counted(project_source, all_import_names)
-    dep_summaries, hefts = _analyze_deps(dep_map, usage)
+    dep_summaries, hefts, indexes, traces = _analyze_deps(dep_map, usage)
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
 
     transitive = None
     if args.transitive:
-        from unladen.collector import discover_site_packages
-
-        sp = args.site_packages or discover_site_packages(project_path)
         # Pass the exclusions so excluded deps can't reappear as
-        # transitive deps of a kept dependency.
-        transitive = _trace_transitive_deps(dep_map, dep_summaries, sp, exclude)
-
-    if args.output_format == "json":
-        print(
-            render_json(
-                reports,
-                excluded_count=len(excluded),
-                project_lloc=project_lloc,
-                transitive=transitive,
-            )
-        )
-        return 0
-
-    from rich.console import Console
-
-    console = Console()
-    render_table(reports, console=console, excluded_count=len(excluded))
-
-    if transitive is not None:
-        _render_transitive(console, transitive)
-
-    if args.treemap:
-        _render_treemap_from_reports(
-            console, reports, project_lloc, _treemap_title(len(excluded))
+        # transitive deps of a kept dependency, and seed the analysis
+        # with the indexes/traces the main report already computed.
+        transitive = _trace_transitive_deps(
+            dep_map, dep_summaries, sp, exclude, indexes, traces
         )
 
-    return 0
+    return _render_check_output(
+        args,
+        reports,
+        transitive,
+        project_lloc,
+        excluded_count=len(excluded),
+        treemap_title=_treemap_title(len(excluded)),
+    )
 
 
 def _cmd_check_package(args: argparse.Namespace, package_name: str) -> int:
     """Check an installed package's dependency usage."""
 
-    from unladen.collector import collect_package_deps, resolve_package_info
+    from unladen.collector import (
+        DistributionNotFound,
+        collect_package_deps,
+        resolve_package_info,
+    )
     from unladen.inspector import inspect_source_files_counted
-    from unladen.reporter import render_json, render_table
 
     sp = args.site_packages or _discover_site_packages()
     if sp is None:
@@ -237,7 +224,9 @@ def _cmd_check_package(args: argparse.Namespace, package_name: str) -> int:
 
     try:
         version, import_names, source_paths = resolve_package_info(package_name, sp)
-    except FileNotFoundError:
+    except DistributionNotFound:
+        # Deliberately narrow: a genuine I/O failure reading dist-info
+        # should surface as a traceback, not "package not found".
         print(
             f"Error: package '{package_name}' not found in {sp}",
             file=sys.stderr,
@@ -257,7 +246,7 @@ def _cmd_check_package(args: argparse.Namespace, package_name: str) -> int:
         all_import_names.update(info["import_names"])
 
     usage, project_lloc = inspect_source_files_counted(source_files, all_import_names)
-    dep_summaries, hefts = _analyze_deps(dep_map, usage)
+    dep_summaries, hefts, indexes, traces = _analyze_deps(dep_map, usage)
 
     reports = _build_reports(dep_map, dep_summaries, hefts)
 
@@ -268,41 +257,43 @@ def _cmd_check_package(args: argparse.Namespace, package_name: str) -> int:
         # Exclude the target itself so a dependency cycle back to it
         # can't list the analyzed package as its own transitive dep.
         transitive = _trace_transitive_deps(
-            dep_map, dep_summaries, sp, {_normalize_dep_name(package_name)}
+            dep_map,
+            dep_summaries,
+            sp,
+            {_normalize_dep_name(package_name)},
+            indexes,
+            traces,
         )
 
-    if args.output_format == "json":
-        print(render_json(reports, project_lloc=project_lloc, transitive=transitive))
-        return 0
-
-    from rich.console import Console
-
-    console = Console()
-    console.print(
-        f"\n[bold]{package_name}[/bold] v{version or '?'} "
-        f"— {len(dep_map)} dependencies\n"
+    return _render_check_output(
+        args,
+        reports,
+        transitive,
+        project_lloc,
+        header=(
+            f"\n[bold]{package_name}[/bold] v{version or '?'} "
+            f"— {len(dep_map)} dependencies\n"
+        ),
     )
-    render_table(reports, console=console)
-
-    if transitive is not None:
-        _render_transitive(console, transitive)
-
-    if args.treemap:
-        _render_treemap_from_reports(console, reports, project_lloc)
-
-    return 0
 
 
 def _analyze_deps(
     dep_map: dict[str, DepInfo], usage: dict[str, UsageEntry]
-) -> tuple[dict[str, DepUsageSummary], dict[str, HeftResult]]:
+) -> tuple[
+    dict[str, DepUsageSummary],
+    dict[str, HeftResult],
+    dict[str, DepIndex],
+    dict[str, TraceResult],
+]:
     """Bridge Phase 2 (inspector) to Phase 3 (tracer).
 
-    Merges per-import-name usage into per-dep summaries,
-    then computes heft ratios for all used deps in a single bulk pass.
+    Merges per-import-name usage into per-dep summaries, bulk-indexes
+    all used deps, and computes heft ratios.  The indexes and traces
+    are returned so ``--transitive`` can seed its caches instead of
+    re-indexing and re-tracing the direct deps.
     """
     from unladen.merger import merge_dep_usage
-    from unladen.tracer import compute_hefts_bulk
+    from unladen.tracer import heft_from_trace, index_dependencies_bulk, trace_index
 
     dep_summaries: dict[str, DepUsageSummary] = {}
     heft_work: list[tuple[str, list[Path], set[str]]] = []
@@ -313,8 +304,14 @@ def _analyze_deps(
         if summary.is_used and info["paths"] and summary.used_names:
             heft_work.append((name, info["paths"], summary.used_names))
 
-    hefts = compute_hefts_bulk(heft_work)
-    return dep_summaries, hefts
+    indexes = index_dependencies_bulk([(name, paths) for name, paths, _ in heft_work])
+    hefts: dict[str, HeftResult] = {}
+    traces: dict[str, TraceResult] = {}
+    for name, _, used_names in heft_work:
+        trace = trace_index(indexes[name], used_names)
+        traces[name] = trace
+        hefts[name] = heft_from_trace(indexes[name], trace, name)
+    return dep_summaries, hefts, indexes, traces
 
 
 def _trace_transitive_deps(
@@ -322,6 +319,8 @@ def _trace_transitive_deps(
     dep_summaries: dict[str, DepUsageSummary],
     site_packages: Path | None,
     exclude: frozenset[str] | set[str] = frozenset(),
+    indexes: dict[str, DepIndex] | None = None,
+    traces: dict[str, TraceResult] | None = None,
 ) -> list[TransitiveDep] | None:
     """Bridge Phase 2.5 output to transitive tracing (``--transitive``).
 
@@ -344,7 +343,58 @@ def _trace_transitive_deps(
         for name, summary in dep_summaries.items()
         if summary.used_names
     }
-    return trace_transitive(dep_map, used_map, site_packages, exclude=exclude)
+    return trace_transitive(
+        dep_map,
+        used_map,
+        site_packages,
+        exclude=exclude,
+        indexes=indexes,
+        traces=traces,
+    )
+
+
+def _render_check_output(
+    args: argparse.Namespace,
+    reports: list[DepReport],
+    transitive: list[TransitiveDep] | None,
+    project_lloc: int,
+    *,
+    excluded_count: int = 0,
+    header: str | None = None,
+    treemap_title: str = "LLOC Treemap",
+) -> int:
+    """Shared output tail for both check modes (JSON or table+extras).
+
+    Keeps flag handling in one place so project and package mode
+    can't drift as output options grow.
+    """
+    from unladen.reporter import render_json, render_table
+
+    if args.output_format == "json":
+        print(
+            render_json(
+                reports,
+                excluded_count=excluded_count,
+                project_lloc=project_lloc,
+                transitive=transitive,
+            )
+        )
+        return 0
+
+    from rich.console import Console
+
+    console = Console()
+    if header:
+        console.print(header)
+    render_table(reports, console=console, excluded_count=excluded_count)
+
+    if transitive is not None:
+        _render_transitive(console, transitive)
+
+    if args.treemap:
+        _render_treemap_from_reports(console, reports, project_lloc, treemap_title)
+
+    return 0
 
 
 def _render_transitive(console: Console, transitive: list[TransitiveDep]) -> None:

@@ -1,38 +1,37 @@
 """Phase 3.5: Transitive dependency measurement (experimental).
 
-Walks the dependency graph breadth-first from the project's used direct
-dependencies.  For each dependency, the names activated by the project
-(or by an upstream dependency) are traced through its call graph; the
-files containing reached definitions are considered *active*, and only
-imports appearing in active files propagate usage to the next level of
-the graph.  This keeps the measurement usage-driven: the heft reported
-for a transitive dependency reflects what the project's own code
-ultimately activates, not everything the intermediate dependency could
-ever use.
+Walks the dependency graph from the project's used direct dependencies
+with a fixpoint worklist.  For each dependency, the names activated by
+the project (or by an upstream dependency) are traced through its call
+graph; the files containing reached definitions are considered
+*active*, and only runtime imports appearing in active files propagate
+usage onward.  When a later-discovered parent contributes new names to
+an already-processed dependency, that dependency is re-enqueued and
+re-propagated, so both its heft and its subtree converge on the full
+accumulated usage regardless of discovery order.
 
 Usage propagates through the import names of each dependency's declared
 (``Requires-Dist``) children.  Shared top-level names (namespace
 packages like ``zope.*``, where parent and child both provide ``zope``)
-are kept — ``merge_dep_usage`` narrows imports to each child's owned
-subpackages, so attribution stays per-distribution.
+are kept, and a child only counts as activated when imports narrowed to
+its *owned* subpackages match (``DepUsageSummary.is_used``) — a parent
+importing its own namespace subpackages does not activate its siblings.
 
 Dependencies that are also declared directly stay in the main report;
 transitive usage still propagates *through* them so their subtrees are
 discovered, but their own reported heft is unchanged (see FUTURE.md).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from unladen._types import DepIndex, HeftResult
 from unladen.collector import (
     DepInfo,
     DistributionNotFound,
     _dist_info_index,
-    _names_and_markers,
-    package_requires,
-    resolve_installed,
+    collect_package_deps,
 )
 from unladen.inspector import inspect_source_files
 from unladen.merger import merge_dep_usage
@@ -45,25 +44,6 @@ from unladen.tracer import (
     index_dependencies_bulk,
     trace_index,
 )
-
-
-class _PendingChild(NamedTuple):
-    """A child dependency discovered during one BFS level."""
-
-    info: DepInfo
-    used_names: set[str]
-    via: set[str]
-
-
-class _CachedTrace(NamedTuple):
-    """A parent's BFS trace with the used-name snapshot it was run for.
-
-    The heft pass reuses the trace only when the snapshot still matches
-    the dep's final used names (no later parent contributed more).
-    """
-
-    used_snapshot: frozenset[str]
-    trace: TraceResult
 
 
 @dataclass
@@ -89,6 +69,20 @@ class TransitiveDep:
         }
 
 
+@dataclass
+class _DepNode:
+    """Internal worklist state for one distribution."""
+
+    info: DepInfo
+    used_names: set[str]
+    depth: int  # first-discovery depth; 0 = direct dep
+    is_direct: bool
+    via: set[str] = field(default_factory=set)
+    # Snapshot of used_names at the last trace, so an unchanged node
+    # (or one seeded from the main report) skips a redundant BFS.
+    traced_with: frozenset[str] | None = None
+
+
 def trace_transitive(
     dep_map: dict[str, DepInfo],
     dep_used_names: dict[str, set[str]],
@@ -96,8 +90,10 @@ def trace_transitive(
     *,
     exclude: frozenset[str] | set[str] = frozenset(),
     max_depth: int = 10,
+    indexes: dict[str, DepIndex] | None = None,
+    traces: dict[str, TraceResult] | None = None,
 ) -> list[TransitiveDep]:
-    """Trace usage through the transitive dependency graph.
+    """Trace usage through the transitive dependency graph to a fixpoint.
 
     Args:
         dep_map: The project's direct dependencies (Phase 1 output).
@@ -108,111 +104,109 @@ def trace_transitive(
             target itself in package mode (so dependency cycles don't
             report the analyzed package as its own transitive dep).
         max_depth: Traversal depth limit (1 = deps of direct deps only).
+        indexes: Optional pre-built DepIndex per direct dep (from the
+            main report's bulk pass) to seed the index cache.
+        traces: Optional TraceResults matching *dep_used_names* (from
+            the main report) to seed the trace cache.
 
     Returns:
-        TransitiveDeps sorted by (depth, name), with heft computed from
-        the accumulated used names.  Dependencies that are also declared
-        directly are excluded from the report (already in the main
-        report) but still propagate usage to their own children.
-
-    Each dependency is processed once, with the used names accumulated
-    at the time it is dequeued; names contributed by parents discovered
-    later still count toward its heft but do not re-propagate (a
-    fixpoint iteration is future work — dependency cycles are rare).
+        TransitiveDeps sorted by (depth, name).  A dependency is
+        re-processed whenever its accumulated used names grow, so heft
+        and subtree discovery are independent of traversal order.
+        Dependencies that are also declared directly are excluded from
+        the report (already in the main report) but still propagate
+        usage to their own children — including new names contributed
+        transitively.
     """
-    direct = set(dep_map)
-    found: dict[str, TransitiveDep] = {}
-    paths: dict[str, list[Path]] = {}
-    # Per-run caches: parent indexes (reused for heft), their traces
-    # (reused when used_names didn't grow), resolved child DepInfos
-    # (each distribution's metadata read once), and the dist-info
-    # directory listing (built once).
-    indexes: dict[str, DepIndex] = {}
-    traces: dict[str, _CachedTrace] = {}
+    indexes = dict(indexes) if indexes else {}
+    traces = dict(traces) if traces else {}
     info_cache: dict[str, DepInfo] = dict(dep_map)
     dist_index = _dist_info_index(site_packages)
+    children_cache: dict[str, dict[str, DepInfo]] = {}
 
-    frontier: list[tuple[str, DepInfo, set[str]]] = []
+    nodes: dict[str, _DepNode] = {}
+    queue: list[str] = []
+    queued: set[str] = set()
+
+    def enqueue(name: str) -> None:
+        node = nodes[name]
+        if (
+            name not in queued
+            and node.depth < max_depth
+            and node.info["installed"]
+            and node.info["paths"]
+        ):
+            queue.append(name)
+            queued.add(name)
+
     for name, info in dep_map.items():
         used = dep_used_names.get(name)
         if used and info["installed"] and info["paths"]:
-            frontier.append((name, info, used))
-    processed = {name for name, _, _ in frontier}
+            node = _DepNode(info, set(used), 0, True)
+            if name in traces:
+                # Seeded trace was computed for exactly these names.
+                node.traced_with = frozenset(used)
+            nodes[name] = node
+            enqueue(name)
 
-    depth = 0
-    while frontier and depth < max_depth:
-        depth += 1
+    while queue:
+        batch, queue, queued = queue, [], set()
 
-        # Resolve each parent's declared children (metadata only) so
-        # childless parents skip indexing entirely.
-        prep: dict[str, tuple[dict[str, DepInfo], set[str]]] = {}
-        for name, _, _ in frontier:
-            children = _resolve_children(name, site_packages, dist_index, info_cache)
-            known = {n for c in children.values() for n in c["import_names"]}
-            if known:
-                prep[name] = (children, known)
-
-        # Batch-index all parents that need it through one worker pool.
+        # Resolve children first (metadata only) so childless parents
+        # skip indexing entirely, then batch-index the rest through
+        # one worker pool.
+        ready: dict[str, dict[str, DepInfo]] = {}
+        for name in batch:
+            children = children_cache.get(name)
+            if children is None:
+                children = children_cache[name] = _resolve_children(
+                    name, site_packages, dist_index, info_cache
+                )
+            if _importable_names(children):
+                ready[name] = children
         indexes.update(
             index_dependencies_bulk(
                 [
-                    (name, info["paths"])
-                    for name, info, _ in frontier
-                    if name in prep and name not in indexes
+                    (name, nodes[name].info["paths"])
+                    for name in ready
+                    if name not in indexes
                 ]
             )
         )
 
-        # One record per child discovered this level.
-        pending: dict[str, _PendingChild] = {}
-        for name, info, used in frontier:
-            if name not in prep:
-                continue
-            children, known = prep[name]
+        for name, children in ready.items():
+            node = nodes[name]
             for child_name, child_info, child_used in _propagate(
-                name, used, children, known, indexes[name], info["paths"], traces
+                name, node, children, indexes[name], traces
             ):
-                if child_name in pending:
-                    prev = pending[child_name]
-                    prev.used_names.update(child_used)
-                    prev.via.add(name)
-                else:
-                    pending[child_name] = _PendingChild(child_info, child_used, {name})
+                if child_name in exclude:
+                    continue
+                child = nodes.get(child_name)
+                if child is None:
+                    child = nodes[child_name] = _DepNode(
+                        child_info,
+                        set(child_used),
+                        node.depth + 1,
+                        child_name in dep_map,
+                    )
+                    if not child.is_direct:
+                        child.via.add(name)
+                    enqueue(child_name)
+                    continue
+                if not child.is_direct:
+                    child.via.add(name)
+                if not child_used <= child.used_names:
+                    # Growth: re-enqueue so heft and the subtree both
+                    # see the accumulated names (fixpoint iteration).
+                    child.used_names |= child_used
+                    enqueue(child_name)
 
-        next_frontier: list[tuple[str, DepInfo, set[str]]] = []
-        for child_name, child in pending.items():
-            if child_name in exclude:
-                continue
-            if child_name in direct:
-                # Not reported here (it's in the main report), but usage
-                # still flows through it so its subtree is discovered —
-                # even when the project itself never imports it.
-                if (
-                    child_name not in processed
-                    and child.info["installed"]
-                    and child.info["paths"]
-                ):
-                    processed.add(child_name)
-                    next_frontier.append((child_name, child.info, child.used_names))
-                continue
-            if child_name in found:
-                found[child_name].used_names.update(child.used_names)
-                found[child_name].via.update(child.via)
-                continue
-            td = TransitiveDep(
-                name=child_name,
-                version=child.info["version"],
-                used_names=child.used_names,
-                via=child.via,
-                depth=depth,
-            )
-            found[child_name] = td
-            paths[child_name] = child.info["paths"]
-            next_frontier.append((child_name, child.info, td.used_names))
-        frontier = next_frontier
+    return _build_results(nodes, indexes, traces)
 
-    _attach_hefts(found, indexes, traces, paths)
-    return sorted(found.values(), key=lambda td: (td.depth, td.name))
+
+def _importable_names(children: dict[str, DepInfo]) -> set[str]:
+    """Union of the children's import names — what can propagate."""
+    return {n for child in children.values() for n in child["import_names"]}
 
 
 def _resolve_children(
@@ -223,47 +217,50 @@ def _resolve_children(
 ) -> dict[str, DepInfo]:
     """Resolve *parent*'s declared dependencies, memoizing per run.
 
-    Children shared by many parents (urllib3, typing-extensions, ...)
-    have their metadata read once; *info_cache* is seeded with the
-    project's direct deps so those are never re-resolved.
+    Delegates to the collector's Requires-Dist pipeline; *info_cache*
+    (seeded with the direct deps) ensures each distribution's metadata
+    is read once per run even when many parents declare it.
     """
     try:
-        specs = package_requires(parent, site_packages, index=dist_index)
+        return collect_package_deps(
+            parent, site_packages, index=dist_index, info_cache=info_cache
+        )
     except DistributionNotFound:
         return {}
-    if not specs:
-        return {}
-    names, markers = _names_and_markers(specs)
-    ordered = list(dict.fromkeys(names))
-    missing = [n for n in ordered if n not in info_cache]
-    if missing:
-        info_cache.update(
-            resolve_installed(missing, site_packages, markers=markers, index=dist_index)
-        )
-    return {n: info_cache[n] for n in ordered}
 
 
 def _propagate(
     name: str,
-    used: set[str],
+    node: _DepNode,
     children: dict[str, DepInfo],
-    known: set[str],
     index: DepIndex,
-    dep_paths: list[Path],
-    traces: dict[str, _CachedTrace],
+    traces: dict[str, TraceResult],
 ) -> list[tuple[str, DepInfo, set[str]]]:
     """Find which names *name*'s active code uses from its children.
 
     Returns (child_dist_name, child_info, used_names) tuples for each
-    installed child referenced from an active file.  The trace is
-    cached in *traces* so the heft pass can reuse it.
+    installed child genuinely referenced from an active file.  The
+    trace is cached in *traces* (and reused when the node's used names
+    haven't changed since the last trace); at the fixpoint the cached
+    trace therefore reflects the node's final used names, which the
+    heft pass relies on.
     """
-    trace = trace_index(index, used)
-    traces[name] = _CachedTrace(frozenset(used), trace)
-    files = files_from_trace(index, trace, dep_paths)
+    known = _importable_names(children)
+    current = frozenset(node.used_names)
+    prev = traces.get(name)
+    if prev is not None and node.traced_with == current:
+        trace = prev
+    else:
+        trace = trace_index(index, node.used_names, ti=prev.ti if prev else None)
+        traces[name] = trace
+        node.traced_with = current
+
+    files = files_from_trace(index, trace, node.info["paths"])
     if not files:
         return []
-    usage = inspect_source_files(files, known)
+    # runtime_only: an `if TYPE_CHECKING:` import must not mark a
+    # child as activated at runtime.
+    usage = inspect_source_files(files, known, runtime_only=True)
 
     results: list[tuple[str, DepInfo, set[str]]] = []
     for child_name, child_info in children.items():
@@ -272,36 +269,52 @@ def _propagate(
         summary = merge_dep_usage(
             child_info["import_names"], usage, child_info["paths"]
         )
-        if summary.used_names:
+        # is_used applies the namespace-owned filtering: a parent's
+        # imports of its own (or a sibling's) subpackages must not
+        # activate this child.  used_names alone is unfiltered.
+        if summary.is_used and summary.used_names:
             results.append((child_name, child_info, summary.used_names))
     return results
 
 
-def _attach_hefts(
-    found: dict[str, TransitiveDep],
+def _build_results(
+    nodes: dict[str, _DepNode],
     indexes: dict[str, DepIndex],
-    traces: dict[str, _CachedTrace],
-    paths: dict[str, list[Path]],
-) -> None:
-    """Compute heft for each discovered transitive dep.
+    traces: dict[str, TraceResult],
+) -> list[TransitiveDep]:
+    """Build reported deps and attach heft.
 
-    Deps that served as parents reuse their cached index — and, when
-    their used names didn't grow after processing, the cached trace,
-    skipping a second BFS.  Leaves (never indexed) batch through the
-    bulk pool in one pass.
+    Traced nodes reuse their final trace (guaranteed current at the
+    fixpoint); indexed-but-stale nodes re-trace from the cached index;
+    never-indexed leaves batch through the bulk pool.
     """
+    results: list[TransitiveDep] = []
     bulk_work: list[tuple[str, list[Path], set[str]]] = []
-    for name, td in found.items():
-        if not td.used_names:
+    pending: dict[str, TransitiveDep] = {}
+
+    for name, node in nodes.items():
+        if node.is_direct:
+            continue
+        td = TransitiveDep(
+            name=name,
+            version=node.info["version"],
+            used_names=node.used_names,
+            via=node.via,
+            depth=node.depth,
+        )
+        results.append(td)
+        if not node.used_names:
             continue
         index = indexes.get(name)
         if index is not None:
-            cached = traces.get(name)
-            if cached is not None and cached.used_snapshot == td.used_names:
-                td.heft = heft_from_trace(index, cached.trace, name)
+            if node.traced_with == frozenset(node.used_names) and name in traces:
+                td.heft = heft_from_trace(index, traces[name], name)
             else:
-                td.heft = heft_from_index(index, td.used_names, name)
-        elif paths.get(name):
-            bulk_work.append((name, paths[name], td.used_names))
+                td.heft = heft_from_index(index, node.used_names, name)
+        elif node.info["paths"]:
+            bulk_work.append((name, node.info["paths"], node.used_names))
+            pending[name] = td
+
     for name, heft in compute_hefts_bulk(bulk_work).items():
-        found[name].heft = heft
+        pending[name].heft = heft
+    return sorted(results, key=lambda td: (td.depth, td.name))

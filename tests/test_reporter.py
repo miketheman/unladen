@@ -846,20 +846,16 @@ class TestTransitiveSignal:
 
 
 class TestIsNativeHeft:
-    def test_native(self):
+    @pytest.mark.parametrize(
+        ("total", "active", "ratio", "opaque", "expected"),
+        [
+            (10, 0, 0.0, 2, True),  # native: extensions, little Python
+            (5000, 100, 0.02, 2, False),  # hybrid: substantial Python
+            (100, 50, 0.5, 0, False),  # pure Python
+        ],
+    )
+    def test_is_native(self, total, active, ratio, opaque, expected):
         from unladen.reporter import is_native_heft
 
-        heft = HeftResult("x", 10, 0, 0.0, opaque_files=2)
-        assert is_native_heft(heft)
-
-    def test_hybrid_large_python_not_native(self):
-        from unladen.reporter import is_native_heft
-
-        heft = HeftResult("x", 5000, 100, 0.02, opaque_files=2)
-        assert not is_native_heft(heft)
-
-    def test_pure_python_not_native(self):
-        from unladen.reporter import is_native_heft
-
-        heft = HeftResult("x", 100, 50, 0.5, opaque_files=0)
-        assert not is_native_heft(heft)
+        heft = HeftResult("x", total, active, ratio, opaque_files=opaque)
+        assert is_native_heft(heft) is expected

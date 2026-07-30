@@ -503,6 +503,7 @@ def collect_package_deps(
     package_name: str,
     site_packages: Path,
     index: dict[str, Path] | None = None,
+    info_cache: dict[str, DepInfo] | None = None,
 ) -> dict[str, DepInfo]:
     """Collect dependencies declared in a package's Requires-Dist metadata.
 
@@ -510,12 +511,23 @@ def collect_package_deps(
     dependencies, then resolves them in site-packages.
     *index* is an optional pre-built dist-info index, passed through
     to name resolution (see ``resolve_installed``).
+    *info_cache* is an optional cross-call memo of resolved DepInfos:
+    already-cached names skip metadata reads, and newly resolved ones
+    are added, so callers resolving many packages (transitive tracing)
+    read each distribution's metadata once.
     """
     specs = package_requires(package_name, site_packages, index)
     if not specs:
         return {}
     dep_names, markers = _names_and_markers(specs)
-    return resolve_installed(dep_names, site_packages, markers=markers, index=index)
+    if info_cache is None:
+        return resolve_installed(dep_names, site_packages, markers=markers, index=index)
+    missing = [n for n in dep_names if n not in info_cache]
+    if missing:
+        info_cache.update(
+            resolve_installed(missing, site_packages, markers=markers, index=index)
+        )
+    return {n: info_cache[n] for n in dep_names}
 
 
 def _normalize_dep_name(dep_spec: str) -> str:

@@ -44,26 +44,34 @@ def load_dep_map(
     project_path: Path,
     req_file: str | None,
     site_packages: Path | None = None,
-) -> dict[str, DepInfo] | None:
+) -> tuple[dict[str, DepInfo], Path | None] | None:
     """Load dependency map, returning None on error.
+
+    Returns ``(dep_map, site_packages)`` so callers needing the
+    environment later (e.g. ``--transitive``) analyze the same
+    site-packages Phase 1 resolved, instead of re-discovering it.
 
     Handles missing project paths, missing dependency files
     (FileNotFoundError from collector when no pyproject.toml,
     setup.py, setup.cfg, or requirements.txt is found), and
     malformed configuration files (ValueError from collector).
     """
-    from unladen.collector import collect_dependencies
+    from unladen.collector import collect_dependencies, discover_site_packages
 
     if not project_path.exists():
         print(f"Error: path does not exist: {project_path}", file=sys.stderr)
         return None
 
+    # Resolve site-packages once; collect_dependencies would otherwise
+    # discover internally and discard the path.
+    sp = site_packages or discover_site_packages(project_path)
     try:
-        return collect_dependencies(
+        dep_map = collect_dependencies(
             project_path,
-            site_packages=site_packages,
+            site_packages=sp,
             requirements=req_file,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return None
+    return dep_map, sp

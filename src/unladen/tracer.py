@@ -5,9 +5,11 @@ and measuring how much of it is activated by the project's imports.
 """
 
 import ast
+import atexit
 import os
 from concurrent.futures import InterpreterPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 from unladen._lloc import count_statements as _count_statements
 from unladen._lloc import is_type_checking_block as _is_type_checking_block
@@ -39,15 +41,8 @@ def heft_from_index(index: DepIndex, used_names: set[str], dep_name: str) -> Hef
 
     Public so callers that already hold a DepIndex (e.g. transitive
     tracing) can compute heft without re-indexing the source tree.
+    ``heft_from_trace`` owns the zero/empty result.
     """
-    if index["total_lloc"] == 0 or not used_names:
-        return HeftResult(
-            dep_name=dep_name,
-            total_lloc=index["total_lloc"],
-            active_lloc=0,
-            heft_ratio=0.0,
-            opaque_files=index["opaque_files"],
-        )
     return heft_from_trace(index, trace_index(index, used_names), dep_name)
 
 
@@ -224,7 +219,7 @@ def _sum_active_lloc(matched: set[str], ti: _TracerIndex) -> int:
     return total
 
 
-class TraceResult:
+class TraceResult(NamedTuple):
     """Result of one reachability BFS over a dependency index.
 
     Produced by ``trace_index()`` and consumed by ``heft_from_trace()``
@@ -232,26 +227,35 @@ class TraceResult:
     computation and the active-file selection.
     """
 
-    __slots__ = ("_ti", "_matched")
-
-    def __init__(self, ti: _TracerIndex, matched: set[str]) -> None:
-        self._ti = ti
-        self._matched = matched
+    ti: _TracerIndex
+    matched: set[str]
 
 
-def trace_index(index: DepIndex, used_names: set[str]) -> TraceResult:
-    """Run the reachability BFS from *used_names* over *index*."""
-    ti = _TracerIndex(index["functions"])
-    if not used_names:
-        return TraceResult(ti, set())
+def trace_index(
+    index: DepIndex,
+    used_names: set[str],
+    ti: _TracerIndex | None = None,
+) -> TraceResult:
+    """Run the reachability BFS from *used_names* over *index*.
+
+    *ti* optionally reuses the lookup tables from a previous trace of
+    the same index (they depend only on the index, not on used_names),
+    so re-tracing after a used-name growth skips their construction.
+    """
+    if ti is None:
+        ti = _TracerIndex(index["functions"])
     matched = _trace_reachable(used_names, ti, index["call_graph"])
     return TraceResult(ti, matched)
 
 
 def heft_from_trace(index: DepIndex, trace: TraceResult, dep_name: str) -> HeftResult:
-    """Compute HeftResult from an already-run trace."""
+    """Compute HeftResult from an already-run trace.
+
+    Single owner of the zero result: an empty index or an empty
+    matched set yields active 0 / ratio 0.0.
+    """
     total_lloc = index["total_lloc"]
-    if total_lloc == 0 or not trace._matched:
+    if total_lloc == 0 or not trace.matched:
         return HeftResult(
             dep_name=dep_name,
             total_lloc=total_lloc,
@@ -259,7 +263,7 @@ def heft_from_trace(index: DepIndex, trace: TraceResult, dep_name: str) -> HeftR
             heft_ratio=0.0,
             opaque_files=index["opaque_files"],
         )
-    active_lloc = _sum_active_lloc(trace._matched, trace._ti)
+    active_lloc = _sum_active_lloc(trace.matched, trace.ti)
     return HeftResult(
         dep_name=dep_name,
         total_lloc=total_lloc,
@@ -274,16 +278,19 @@ def files_from_trace(
 ) -> list[Path]:
     """Return the source files containing definitions the trace reached.
 
-    Selection is by per-definition file provenance (``FuncDef["path"]``),
+    Selection is by definition file provenance (``FuncDef["path"]``),
     so two same-named modules in different subpackages don't activate
-    each other.  Ancestor ``__init__.py`` files are included — importing
-    anything from a package executes every ``__init__`` on the way down.
+    each other through module-stem keys.  (Matching is still by name:
+    two same-named *definitions* both match — an over-approximation
+    inherited from the name-based BFS; see FUTURE.md.)
+    Ancestor ``__init__.py`` files are included — importing anything
+    from a package executes every ``__init__`` on the way down.
     *dep_paths* bounds the ancestor walk to the dependency's own roots,
-    and membership in the index's file list replaces per-directory stat
-    calls (every ancestor ``__init__.py`` of an indexed file is itself
-    indexed).
+    and membership in the index's parsed-file list replaces
+    per-directory stat calls (every ancestor ``__init__.py`` of an
+    indexed file was itself collected).
     """
-    matched = trace._matched
+    matched = trace.matched
     selected: set[Path] = set()
     for func in index["functions"]:
         if func["name"] in matched:
@@ -308,15 +315,6 @@ def files_from_trace(
             if d == root:
                 break
     return sorted(selected)
-
-
-def active_files(
-    index: DepIndex, used_names: set[str], dep_paths: list[Path]
-) -> list[Path]:
-    """Convenience wrapper: trace *used_names* and return activated files."""
-    if not used_names:
-        return []
-    return files_from_trace(index, trace_index(index, used_names), dep_paths)
 
 
 def index_dependency(dep_paths: list[Path]) -> DepIndex:
@@ -346,11 +344,21 @@ def index_dependencies_bulk(
     if not items:
         return {}
 
+    # Coalesce duplicate dep names first: accumulating files under one
+    # name while overwriting its file list would misalign the zip in
+    # _assemble_index and corrupt provenance.
+    merged_paths: dict[str, list[Path]] = {}
+    for dep_name, dep_paths in items:
+        existing = merged_paths.setdefault(dep_name, [])
+        for p in dep_paths:
+            if p not in existing:
+                existing.append(p)
+
     all_files: list[Path] = []
     file_dep: list[str] = []
     dep_files: dict[str, list[Path]] = {}
     dep_opaque: dict[str, int] = {}
-    for dep_name, dep_paths in items:
+    for dep_name, dep_paths in merged_paths.items():
         py_files, opaque_files = _collect_source_files(dep_paths)
         dep_files[dep_name] = py_files
         dep_opaque[dep_name] = opaque_files
@@ -406,11 +414,16 @@ def _assemble_index(
     total_lloc = 0
     functions: list[FuncDef] = []
     call_graph: dict[str, set[str]] = {}
+    parsed_files: list[Path] = []
     for result, path in zip(file_results, py_files):
         if result is None:
+            # Unparseable file: keep it out of "files" so consumers
+            # (ancestor-__init__ selection) never treat it as usable
+            # and later re-parse it just to warn.
             continue
         lloc, defs, calls = result
         total_lloc += lloc
+        parsed_files.append(path)
         for d in defs:
             d["path"] = path
         functions.extend(defs)
@@ -424,7 +437,7 @@ def _assemble_index(
         "functions": functions,
         "opaque_files": opaque_files,
         "call_graph": call_graph,
-        "files": list(py_files),
+        "files": parsed_files,
     }
 
 
@@ -443,6 +456,22 @@ def _index_single_file(py_file: Path) -> _FileIndex | None:
     return lloc, defs, calls
 
 
+# Shared worker pool, created lazily on first parallel batch and
+# reused for the rest of the process (shut down at exit).  A transitive
+# run indexes one batch per BFS level; re-creating subinterpreters for
+# each batch would pay the pool startup cost every level.
+_WORKER_POOL: InterpreterPoolExecutor | None = None
+_POOL_WORKERS = min(os.cpu_count() or 1, 6)
+
+
+def _get_worker_pool() -> InterpreterPoolExecutor:
+    global _WORKER_POOL
+    if _WORKER_POOL is None:
+        _WORKER_POOL = InterpreterPoolExecutor(max_workers=_POOL_WORKERS)
+        atexit.register(_WORKER_POOL.shutdown)
+    return _WORKER_POOL
+
+
 def _index_files_parallel(
     py_files: list[Path],
 ) -> list[_FileIndex | None]:
@@ -452,10 +481,9 @@ def _index_files_parallel(
     Capped at 6 workers to avoid diminishing returns from context
     switching.  Chunksize tuned to ~4 batches per worker.
     """
-    workers = min(os.cpu_count() or 1, 6)
-    chunksize = max(1, len(py_files) // (workers * 4))
-    with InterpreterPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(_index_single_file, py_files, chunksize=chunksize))
+    chunksize = max(1, len(py_files) // (_POOL_WORKERS * 4))
+    pool = _get_worker_pool()
+    return list(pool.map(_index_single_file, py_files, chunksize=chunksize))
 
 
 _OPAQUE_SUFFIXES = frozenset((".so", ".pyd", ".dylib"))

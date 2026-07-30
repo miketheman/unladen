@@ -73,19 +73,11 @@ class DepReport:
 
     @property
     def heft_pct(self) -> str:
-        if self.heft is None:
-            return "-"
-        if self.is_native:
-            return "n/a"
-        return format_heft_pct(self.heft.heft_ratio)
+        return _heft_cells(self.heft, self.is_native)[0]
 
     @property
     def lloc_display(self) -> str:
-        if self.heft is None:
-            return "-"
-        if self.is_native:
-            return _pluralize(self.heft.opaque_files, "extension", "extensions")
-        return format_lloc(self.heft.active_lloc, self.heft.total_lloc)
+        return _heft_cells(self.heft, self.is_native)[1]
 
     @property
     def status(self) -> str:
@@ -189,6 +181,22 @@ def is_native_heft(heft: HeftResult) -> bool:
     Mirrors the KEEP_NATIVE branch of ``recommend()``.
     """
     return heft.opaque_files > 0 and heft.total_lloc < MASS_THRESHOLD
+
+
+def _heft_cells(heft: HeftResult | None, native: bool) -> tuple[str, str]:
+    """Shared (heft %, LLOC) display cells for every table.
+
+    Single owner of the three-way rule: no heft -> dashes, native ->
+    "n/a" plus extension count, else percentage and active/total.
+    """
+    if heft is None:
+        return "-", "-"
+    if native:
+        return "n/a", _pluralize(heft.opaque_files, "extension", "extensions")
+    return (
+        format_heft_pct(heft.heft_ratio),
+        format_lloc(heft.active_lloc, heft.total_lloc),
+    )
 
 
 def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
@@ -368,30 +376,34 @@ def render_table(
         )
 
 
-# Utilization signals for transitive deps: same thresholds as
+# Utilization labels for transitive deps: same thresholds as
 # recommend(), relabeled because the action target is the parent
 # shown in "Via", not the dep itself (which can't be removed directly).
-_TRANSITIVE_SIGNALS = {
-    Recommendation.KEEP: ("Well used", "green"),
-    Recommendation.KEEP_NATIVE: ("Native", "green"),
-    Recommendation.REVIEW: ("Partially used", "yellow"),
-    Recommendation.VENDOR: ("Barely used", "cyan"),
-    Recommendation.REWRITE: ("Dead weight", "red"),
-    Recommendation.REMOVE: ("Unused", "magenta"),
+# Styles come from _REC_STYLES so the two tables can never diverge.
+_TRANSITIVE_LABELS = {
+    Recommendation.KEEP: "Well used",
+    Recommendation.KEEP_NATIVE: "Native",
+    Recommendation.REVIEW: "Partially used",
+    Recommendation.VENDOR: "Barely used",
+    Recommendation.REWRITE: "Dead weight",
+    Recommendation.REMOVE: "Unused",
 }
 
 
 def _transitive_signal(heft: HeftResult | None) -> tuple[str, str]:
     """Map a transitive dep's heft to a (label, style) utilization signal.
 
-    Reuses ``recommend()``'s thresholds so the transitive table's colors
-    stay consistent with the main report.  "Dead weight" (red) marks the
-    actionable rows: a heavy dependency dragged in by its "Via" parent
-    but barely activated by the project's usage.
+    Reuses ``recommend()``'s thresholds and ``_REC_STYLES``' colors so
+    the transitive table stays consistent with the main report.
+    "Dead weight" (red) marks the actionable rows: a heavy dependency
+    dragged in by its "Via" parent but barely activated by the
+    project's usage.  Unmapped future recommendations degrade to the
+    enum label rather than crashing the renderer.
     """
     if heft is None:
         return "-", "dim"
-    return _TRANSITIVE_SIGNALS[recommend(heft)]
+    rec = recommend(heft)
+    return _TRANSITIVE_LABELS.get(rec, rec.value), _REC_STYLES.get(rec, "white")
 
 
 def render_transitive_table(
@@ -433,16 +445,9 @@ def render_transitive_table(
     )
     for td in ordered:
         label, style = _transitive_signal(td.heft)
-        if td.heft is None:
-            heft_pct, lloc = "-", "-"
-        elif is_native_heft(td.heft):
-            # Same rule as the main table: LLOC ratios don't describe
-            # compiled extensions, so don't render "0.0%" for them.
-            heft_pct = "n/a"
-            lloc = _pluralize(td.heft.opaque_files, "extension", "extensions")
-        else:
-            heft_pct = format_heft_pct(td.heft.heft_ratio)
-            lloc = format_lloc(td.heft.active_lloc, td.heft.total_lloc)
+        heft_pct, lloc = _heft_cells(
+            td.heft, td.heft is not None and is_native_heft(td.heft)
+        )
         table.add_row(
             td.name,
             td.version or "-",

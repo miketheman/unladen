@@ -405,6 +405,226 @@ class TestTraceTransitive:
         assert eggs.heft is not None
         assert eggs.heft.active_lloc == 4
 
+    def test_used_direct_dep_accumulates_and_repropagates(self, tmp_path):
+        """Fixpoint: names contributed into a USED direct dep re-propagate.
+
+        The project uses eggs.poach directly; spam's active code uses
+        eggs.scramble, whose file imports bacon.  eggs must be
+        re-processed with the union so bacon is discovered.
+        """
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "spam",
+            "1.0",
+            requires=["eggs"],
+            files={
+                "spam/__init__.py": (
+                    "from eggs import scramble\n"
+                    "\n"
+                    "def breakfast():\n"
+                    "    return scramble()\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp,
+            "eggs",
+            "2.0",
+            requires=["bacon"],
+            files={
+                "eggs/__init__.py": "",
+                "eggs/poach_mod.py": "def poach():\n    return 1\n",
+                "eggs/scramble_mod.py": (
+                    "from bacon import sizzle\n\ndef scramble():\n    return sizzle()\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp,
+            "bacon",
+            "3.0",
+            files={"bacon/__init__.py": "def sizzle():\n    return 1\n"},
+        )
+        dep_map = _direct_dep_map(sp, ["spam", "eggs"])
+        result = trace_transitive(
+            dep_map, {"spam": {"breakfast"}, "eggs": {"poach"}}, sp
+        )
+        names = {td.name for td in result}
+        assert "bacon" in names
+        assert "eggs" not in names  # direct: stays in the main report
+
+    def test_late_contribution_unlocks_grandchild(self, chain_site_packages):
+        """Fixpoint: a name contributed by a later parent re-propagates.
+
+        eggs is first traced with {scramble}; muffin later adds {poach},
+        and poach's file imports salt — salt must still be discovered.
+        """
+        _make_dist(
+            chain_site_packages,
+            "crumpet",
+            "1.0",
+            requires=["muffin"],
+            files={
+                "crumpet/__init__.py": (
+                    "from muffin import warm\n\ndef tea():\n    return warm()\n"
+                ),
+            },
+        )
+        _make_dist(
+            chain_site_packages,
+            "muffin",
+            "1.0",
+            requires=["eggs2"],
+            files={
+                "muffin/__init__.py": (
+                    "from eggs2 import poach\n\ndef warm():\n    return poach()\n"
+                ),
+            },
+        )
+        _make_dist(
+            chain_site_packages,
+            "eggs2",
+            "1.0",
+            requires=["salt"],
+            files={
+                "eggs2/__init__.py": "",
+                "eggs2/scramble_mod.py": "def scramble():\n    return 1\n",
+                "eggs2/poach_mod.py": (
+                    "from salt import pinch\n\ndef poach():\n    return pinch()\n"
+                ),
+            },
+        )
+        _make_dist(
+            chain_site_packages,
+            "salt",
+            "1.0",
+            files={"salt/__init__.py": "def pinch():\n    return 1\n"},
+        )
+        _make_dist(
+            chain_site_packages,
+            "toastr",
+            "1.0",
+            requires=["eggs2"],
+            files={
+                "toastr/__init__.py": (
+                    "from eggs2 import scramble\n"
+                    "\n"
+                    "def crunch():\n"
+                    "    return scramble()\n"
+                ),
+            },
+        )
+        dep_map = _direct_dep_map(chain_site_packages, ["toastr", "crumpet"])
+        result = trace_transitive(
+            dep_map,
+            {"toastr": {"crunch"}, "crumpet": {"tea"}},
+            chain_site_packages,
+        )
+        salt = next((td for td in result if td.name == "salt"), None)
+        assert salt is not None
+        assert "pinch" in salt.used_names
+
+    def test_namespace_self_import_does_not_activate_sibling(self, tmp_path):
+        """A parent importing its OWN namespace subpackages must not
+        mark a declared namespace sibling as used."""
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "ns-component",
+            "1.0",
+            requires=["ns-interface"],
+            top_level="ns",
+            files={
+                "ns/component/__init__.py": (
+                    "from ns.component.helpers import x\n"
+                    "\n"
+                    "def register():\n"
+                    "    return x\n"
+                ),
+                "ns/component/helpers.py": "x = 1\n",
+            },
+        )
+        _make_dist(
+            sp,
+            "ns-interface",
+            "2.0",
+            top_level="ns",
+            files={
+                "ns/interface/__init__.py": (
+                    "class Iface:\n    def provided_by(self):\n        return True\n"
+                ),
+            },
+        )
+        dep_map = _direct_dep_map(sp, ["ns-component"])
+        result = trace_transitive(dep_map, {"ns-component": {"register"}}, sp)
+        assert result == []
+
+    def test_pathless_child_has_no_heft(self, tmp_path):
+        """An installed child whose sources can't be resolved is reported
+        without heft (rendered '-'), even when it declares children —
+        never as a misleading 0/0 'Barely used' row."""
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "par",
+            "1.0",
+            requires=["weird"],
+            files={
+                "par/__init__.py": (
+                    "from weird import thing\n\ndef go():\n    return thing\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp, "weird", "1.0", requires=["leafy"], files={"weird_data.txt": "x\n"}
+        )
+        _make_dist(
+            sp,
+            "leafy",
+            "1.0",
+            files={"leafy/__init__.py": "def leaf():\n    return 1\n"},
+        )
+        dep_map = _direct_dep_map(sp, ["par"])
+        result = trace_transitive(dep_map, {"par": {"go"}}, sp)
+        weird = next(td for td in result if td.name == "weird")
+        assert weird.heft is None
+
+    def test_type_checking_import_not_propagated(self, tmp_path):
+        """A typing-only import in a parent's active file must not count
+        as runtime activation of the child."""
+        sp = tmp_path / "sp"
+        _make_dist(
+            sp,
+            "typedpar",
+            "1.0",
+            requires=["numpyish"],
+            files={
+                "typedpar/__init__.py": (
+                    "from typing import TYPE_CHECKING\n"
+                    "\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from numpyish import ndarray\n"
+                    "\n"
+                    "def go():\n"
+                    "    return 1\n"
+                ),
+            },
+        )
+        _make_dist(
+            sp,
+            "numpyish",
+            "1.0",
+            files={
+                "numpyish/__init__.py": (
+                    "class ndarray:\n    def sum(self):\n        return 0\n"
+                )
+            },
+        )
+        dep_map = _direct_dep_map(sp, ["typedpar"])
+        result = trace_transitive(dep_map, {"typedpar": {"go"}}, sp)
+        assert result == []
+
     def test_to_dict(self, chain_site_packages):
         dep_map = _direct_dep_map(chain_site_packages, ["spam"])
         result = trace_transitive(dep_map, {"spam": {"breakfast"}}, chain_site_packages)

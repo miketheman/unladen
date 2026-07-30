@@ -92,26 +92,24 @@ heft accuracy for typing-heavy projects.
 `check --transitive` (experimental) ships with deliberate
 simplifications worth revisiting:
 
-- **Fixpoint iteration.**
-  Each dep is processed once with the used names known when dequeued;
-  names contributed by later-discovered parents count toward heft
-  but do not re-propagate to grandchildren.
+- **Definition-level activation precision.**
+  Matching is by bare name end-to-end, so a used name activates
+  *every* same-named definition — `from foo.http import client`
+  also activates `foo/db/client.py` (and its imports) through the
+  module-name fallback.
+  The real fix is threading dotted context through the pipeline:
+  the inspector already sees `foo.http.client`, so used names could
+  carry their dotted module path, letting the tracer narrow
+  candidate definitions to files whose path matches before falling
+  back to bare-name resolution.
+  Touches inspector output, merger pass-through, and tracer entry
+  resolution; also improves main-report heft accuracy.
 - **Transitive usage into direct deps.**
-  Usage now propagates *through* direct deps (so their subtrees are
-  discovered), but the extra activation still doesn't raise the
-  direct dep's reported heft.  Showing "direct + transitive" heft
-  per dep would give a truer total-activation picture.
-- **Index reuse with the main report.**
-  Within the transitive pass each dep is indexed at most once
-  (batch-indexed per BFS level; index and trace reused for heft),
-  but *direct* deps are still indexed separately by the main
-  report's bulk pass.  Having `compute_hefts_bulk` optionally
-  return its indexes would remove that remaining duplication.
-- **Single site-packages resolution.**
-  Project mode re-runs `discover_site_packages` for `--transitive`
-  because `collect_dependencies` discards the path it discovered.
-  Threading the resolved path out of Phase 1 would guarantee both
-  reports analyze the same environment.
+  Usage propagates *through* direct deps (their subtrees are
+  discovered, and re-propagated at the fixpoint), but the extra
+  activation still doesn't raise the direct dep's reported heft.
+  Showing "direct + transitive" heft per dep would give a truer
+  total-activation picture.
 - **Parse-once for import extraction.**
   `inspect_source_files` re-parses a parent's *active* files to find
   their imports after indexing already parsed them.

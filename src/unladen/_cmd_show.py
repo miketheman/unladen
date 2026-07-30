@@ -27,9 +27,10 @@ from unladen.tracer import compute_heft
 def cmd_show(args: argparse.Namespace) -> int:
     """Show detailed usage information for a single dependency."""
     project_path, req_file = _resolve_show_args(args)
-    dep_map = load_dep_map(project_path, req_file, args.site_packages)
-    if dep_map is None:
+    loaded = load_dep_map(project_path, req_file, args.site_packages)
+    if loaded is None:
         return 1
+    dep_map, _ = loaded
 
     # dep_map keys are PEP 503 normalized; accept any spelling the user
     # gives (e.g. ``typing_extensions`` for ``typing-extensions``).
@@ -147,10 +148,10 @@ def _show_imports_table(
 
     sorted_imports = sorted(imports, key=lambda i: (str(i.source_file), i.lineno or 0))
     for imp in sorted_imports:
-        if imp.source_file is None:
-            # ImportInfo allows a None source_file; imports collected
-            # from project inspection always have one.
-            continue
+        # ImportInfo allows a None source_file for other producers, but
+        # project inspection always records one — fail loudly if that
+        # invariant ever breaks rather than silently dropping rows.
+        assert imp.source_file is not None
         rel_path = str(imp.source_file.relative_to(project_path))
         location = f"{rel_path}:{imp.lineno}" if imp.lineno else rel_path
         if imp.name:
