@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
     from rich.console import Console
 
+    from unladen.transitive import TransitiveDep
+
 from unladen._types import HeftResult
 
 # Mass threshold separating "small" from "large" dependencies.
@@ -71,19 +73,11 @@ class DepReport:
 
     @property
     def heft_pct(self) -> str:
-        if self.heft is None:
-            return "-"
-        if self.is_native:
-            return "n/a"
-        return f"{self.heft.heft_ratio * 100:.1f}%"
+        return _heft_cells(self.heft, self.is_native)[0]
 
     @property
     def lloc_display(self) -> str:
-        if self.heft is None:
-            return "-"
-        if self.is_native:
-            return _pluralize(self.heft.opaque_files, "extension", "extensions")
-        return f"{self.heft.active_lloc}/{self.heft.total_lloc}"
+        return _heft_cells(self.heft, self.is_native)[1]
 
     @property
     def status(self) -> str:
@@ -155,19 +149,54 @@ class DepReport:
             d["import_count"] = self.import_count
             d["file_count"] = self.file_count
             d["string_ref_count"] = self.string_ref_count
-            if self.heft is not None:
-                d["heft"] = {
-                    "ratio": self.heft.heft_ratio,
-                    "active_lloc": self.heft.active_lloc,
-                    "total_lloc": self.heft.total_lloc,
-                    "opaque_files": self.heft.opaque_files,
-                }
-            else:
-                d["heft"] = None
+            d["heft"] = self.heft.to_dict() if self.heft is not None else None
             d["recommendation"] = (
                 self.recommendation.value if self.recommendation else None
             )
         return d
+
+
+def format_heft_pct(ratio: float) -> str:
+    """Format a heft ratio as a percentage.
+
+    Shared by every renderer (check table, transitive table, show).
+    """
+    return f"{ratio * 100:.1f}%"
+
+
+def format_lloc(active: int, total: int) -> str:
+    """Format active/total LLOC.
+
+    Takes plain ints so non-HeftResult carriers (e.g. treemap tiles)
+    can share the format.
+    """
+    return f"{active}/{total}"
+
+
+def is_native_heft(heft: HeftResult) -> bool:
+    """True when a dep is primarily native code.
+
+    Compiled extensions with little Python mean the LLOC ratio does
+    not describe the dependency; renderers show "n/a" instead.
+    Mirrors the KEEP_NATIVE branch of ``recommend()``.
+    """
+    return heft.opaque_files > 0 and heft.total_lloc < MASS_THRESHOLD
+
+
+def _heft_cells(heft: HeftResult | None, native: bool) -> tuple[str, str]:
+    """Shared (heft %, LLOC) display cells for every table.
+
+    Single owner of the three-way rule: no heft -> dashes, native ->
+    "n/a" plus extension count, else percentage and active/total.
+    """
+    if heft is None:
+        return "-", "-"
+    if native:
+        return "n/a", _pluralize(heft.opaque_files, "extension", "extensions")
+    return (
+        format_heft_pct(heft.heft_ratio),
+        format_lloc(heft.active_lloc, heft.total_lloc),
+    )
 
 
 def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
@@ -211,10 +240,10 @@ def recommend(heft: HeftResult) -> Recommendation:
     carries mass the LLOC analysis cannot see, so a low Python ratio
     cannot justify inlining advice.  They cap at Review.
     """
-    if heft.opaque_files:
+    if is_native_heft(heft):
         # Primarily native: little Python to analyze
-        if heft.total_lloc < MASS_THRESHOLD:
-            return Recommendation.KEEP_NATIVE
+        return Recommendation.KEEP_NATIVE
+    if heft.opaque_files:
         # Hybrid native: ratio only describes the Python portion
         if heft.heft_ratio > 0.25:
             return Recommendation.KEEP
@@ -241,11 +270,14 @@ def render_json(
     output: Path | None = None,
     excluded_count: int = 0,
     project_lloc: int = 0,
+    transitive: list[TransitiveDep] | None = None,
 ) -> str:
     """Serialize dependency reports as JSON.
 
     Returns the JSON string.
     When *output* is given, also writes to that file path.
+    When *transitive* is given (``--transitive``), a ``transitive``
+    key is added with per-dep usage traced through the dependency graph.
     """
     payload: dict[str, Any] = {
         "dependencies": [r.to_dict() for r in sorted(reports, key=lambda r: r.name)],
@@ -257,6 +289,8 @@ def render_json(
             "project_lloc": project_lloc,
         },
     }
+    if transitive is not None:
+        payload["transitive"] = [td.to_dict() for td in transitive]
     text = json.dumps(payload, indent=2)
     if output is not None:
         output.write_text(text, encoding="utf-8")
@@ -340,3 +374,108 @@ def render_table(
             f"[dim]* {excluded_count} dependenc{s} excluded "
             f"via \\[tool.unladen] config[/dim]"
         )
+
+
+# Utilization labels for transitive deps: same thresholds as
+# recommend(), relabeled because the action target is the parent
+# shown in "Via", not the dep itself (which can't be removed directly).
+# Styles come from _REC_STYLES so the two tables can never diverge.
+_TRANSITIVE_LABELS = {
+    Recommendation.KEEP: "Well used",
+    Recommendation.KEEP_NATIVE: "Native",
+    Recommendation.REVIEW: "Partially used",
+    Recommendation.VENDOR: "Barely used",
+    Recommendation.REWRITE: "Dead weight",
+    Recommendation.REMOVE: "Unused",
+}
+
+
+def _transitive_signal(heft: HeftResult | None) -> tuple[str, str]:
+    """Map a transitive dep's heft to a (label, style) utilization signal.
+
+    Reuses ``recommend()``'s thresholds and ``_REC_STYLES``' colors so
+    the transitive table stays consistent with the main report.
+    "Dead weight" (red) marks the actionable rows: a heavy dependency
+    dragged in by its "Via" parent but barely activated by the
+    project's usage.  Unmapped future recommendations degrade to the
+    enum label rather than crashing the renderer.
+    """
+    if heft is None:
+        return "-", "dim"
+    rec = recommend(heft)
+    return _TRANSITIVE_LABELS.get(rec, rec.value), _REC_STYLES.get(rec, "white")
+
+
+def render_transitive_table(
+    transitive: list[TransitiveDep],
+    *,
+    console: Console,
+) -> None:
+    """Render transitive dependency usage as a rich table.
+
+    Rows sort heaviest-first (total LLOC) so the deps worth attention
+    surface at the top.  The Utilization column colors each dep by the
+    main report's heft thresholds; acting on a row means acting on its
+    "Via" parent.  A dim footer summarizes the total transitive
+    footprint.
+    """
+    if not transitive:
+        console.print(
+            "[dim]No transitive dependency usage detected from active code paths.[/dim]"
+        )
+        return
+
+    table = Table(
+        title="unladen - Transitive Dependency Heft (experimental)",
+        show_lines=True,
+    )
+    table.add_column("Dependency", style="bold")
+    table.add_column("Version")
+    table.add_column("Via")
+    table.add_column("Depth", justify="right")
+    table.add_column("Names\nUsed", justify="right")
+    table.add_column("Heft %", justify="right")
+    table.add_column("LLOC\n(active/total)", justify="right")
+    table.add_column("Utilization")
+
+    # Heaviest first; rows without heft data sort last.
+    ordered = sorted(
+        transitive,
+        key=lambda td: (-(td.heft.total_lloc) if td.heft else 1, td.name),
+    )
+    for td in ordered:
+        label, style = _transitive_signal(td.heft)
+        heft_pct, lloc = _heft_cells(
+            td.heft, td.heft is not None and is_native_heft(td.heft)
+        )
+        table.add_row(
+            td.name,
+            td.version or "-",
+            ", ".join(sorted(td.via)),
+            str(td.depth),
+            str(len(td.used_names)),
+            f"[{style}]{heft_pct}[/{style}]",
+            lloc,
+            f"[{style}]{label}[/{style}]",
+        )
+
+    console.print(table)
+    _print_transitive_summary(console, transitive)
+
+
+def _print_transitive_summary(
+    console: Console, transitive: list[TransitiveDep]
+) -> None:
+    """Print a one-line footprint summary under the transitive table."""
+    with_heft = [td.heft for td in transitive if td.heft is not None]
+    total = sum(h.total_lloc for h in with_heft)
+    active = sum(h.active_lloc for h in with_heft)
+    parents = {parent for td in transitive for parent in td.via}
+    count = _pluralize(
+        len(transitive), "transitive dependency", "transitive dependencies"
+    )
+    line = f"{count} via {_pluralize(len(parents), 'parent')}"
+    if total:
+        pct = format_heft_pct(active / total)
+        line += f" — {format_lloc(active, total)} LLOC activated ({pct})"
+    console.print(f"[dim]{line}[/dim]")

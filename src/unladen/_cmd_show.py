@@ -13,22 +13,24 @@ from rich.console import Console
 from rich.table import Table
 
 from unladen._config import load_dep_map, load_exclude_set
-from unladen.collector import _normalize_dep_name, dependency_source
-from unladen.inspector import inspect_project
+from unladen.collector import DepInfo, _normalize_dep_name, dependency_source
+from unladen.inspector import ImportInfo, StringRef, inspect_project
 from unladen.merger import (
     _owned_module_prefixes,
     detect_dynamic_dispatch,
     merge_dep_usage,
 )
+from unladen.reporter import format_heft_pct, format_lloc
 from unladen.tracer import compute_heft
 
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Show detailed usage information for a single dependency."""
     project_path, req_file = _resolve_show_args(args)
-    dep_map = load_dep_map(project_path, req_file, args.site_packages)
-    if dep_map is None:
+    loaded = load_dep_map(project_path, req_file, args.site_packages)
+    if loaded is None:
         return 1
+    dep_map, _ = loaded
 
     # dep_map keys are PEP 503 normalized; accept any spelling the user
     # gives (e.g. ``typing_extensions`` for ``typing-extensions``).
@@ -79,8 +81,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     if info["paths"]:
         heft = compute_heft(info["paths"], summary.used_names, dep_name)
         console.print(
-            f"\n[bold]Heft:[/bold] {heft.active_lloc}/{heft.total_lloc} "
-            f"LLOC ({heft.heft_ratio * 100:.1f}%)"
+            f"\n[bold]Heft:[/bold] {format_lloc(heft.active_lloc, heft.total_lloc)} "
+            f"LLOC ({format_heft_pct(heft.heft_ratio)})"
         )
         if heft.opaque_files:
             console.print(f"  {heft.opaque_files} binary extension(s) not analyzed")
@@ -99,14 +101,20 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_show_args(args: argparse.Namespace):
+def _resolve_show_args(args: argparse.Namespace) -> tuple[Path, str | None]:
     """Resolve show command args to project path and requirements file."""
     project_path = args.path.resolve()
     req_file = str(Path(args.requirements).resolve()) if args.requirements else None
     return project_path, req_file
 
 
-def _show_header(console, dep_name, info, project_path, req_file):
+def _show_header(
+    console: Console,
+    dep_name: str,
+    info: DepInfo,
+    project_path: Path,
+    req_file: str | None,
+) -> None:
     """Render the show command header (name, version, source, exclusion)."""
     exclude = load_exclude_set(project_path)
     is_excluded = _normalize_dep_name(dep_name) in exclude
@@ -130,7 +138,9 @@ def _show_header(console, dep_name, info, project_path, req_file):
         console.print("[dim]* Excluded from analysis via \\[tool.unladen] config[/dim]")
 
 
-def _show_imports_table(console, imports: list, project_path: Path) -> None:
+def _show_imports_table(
+    console: Console, imports: list[ImportInfo], project_path: Path
+) -> None:
     """Render import statements as a Rich table."""
     table = Table(title="Import Statements", show_lines=True)
     table.add_column("Location", style="cyan")
@@ -138,6 +148,10 @@ def _show_imports_table(console, imports: list, project_path: Path) -> None:
 
     sorted_imports = sorted(imports, key=lambda i: (str(i.source_file), i.lineno or 0))
     for imp in sorted_imports:
+        # ImportInfo allows a None source_file for other producers, but
+        # project inspection always records one — fail loudly if that
+        # invariant ever breaks rather than silently dropping rows.
+        assert imp.source_file is not None
         rel_path = str(imp.source_file.relative_to(project_path))
         location = f"{rel_path}:{imp.lineno}" if imp.lineno else rel_path
         if imp.name:
@@ -152,7 +166,9 @@ def _show_imports_table(console, imports: list, project_path: Path) -> None:
     console.print(table)
 
 
-def _show_string_refs_table(console, refs: list, project_path: Path) -> None:
+def _show_string_refs_table(
+    console: Console, refs: list[StringRef], project_path: Path
+) -> None:
     """Render string references as a Rich table."""
     table = Table(title="String References", show_lines=True)
     table.add_column("Location", style="cyan")

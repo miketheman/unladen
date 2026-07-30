@@ -37,6 +37,8 @@ from rich.color import Color
 from rich.segment import Segment
 from rich.style import Style
 
+from unladen.reporter import format_lloc
+
 if TYPE_CHECKING:
     from rich.console import Console, ConsoleOptions, RenderResult
 
@@ -293,7 +295,7 @@ def _build_label_cells(
     #   h <  3: (no label — handled by early return above)
     lines: list[str] = [name]
     if h >= 4:
-        lloc = f"{tile.active_lloc}/{tile.total_lloc}"
+        lloc = format_lloc(tile.active_lloc, tile.total_lloc)
         pct = f"{tile.heft_ratio * 100:.0f}% used"
         if len(lloc) <= usable - 1:
             lines.append(lloc)

@@ -18,7 +18,9 @@ from unladen.tracer import (
     _TracerIndex,
     compute_heft,
     compute_hefts_bulk,
+    files_from_trace,
     index_dependency,
+    trace_index,
 )
 
 
@@ -1707,3 +1709,76 @@ class TestConditionalBlockCallGraph:
         )
         calls = _extract_calls(f)
         assert "loader" in calls.get("HANDLERS", set())
+
+
+def _active_files(index, used_names, dep_paths):
+    """Test helper: the composition production code uses."""
+    return files_from_trace(index, trace_index(index, used_names), dep_paths)
+
+
+class TestActiveFiles:
+    """files_from_trace: map traced usage back to activated source files."""
+
+    def test_active_file_and_ancestor_inits(self, tmp_path):
+        """Activating a submodule also activates ancestor __init__.py
+        files (importing anything executes them), but not siblings."""
+        pkg = tmp_path / "spam"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("from spam.core import breakfast\n")
+        (pkg / "core.py").write_text("def breakfast():\n    return 1\n")
+        (pkg / "unused.py").write_text("def lunch():\n    return 2\n")
+
+        files = _active_files(index_dependency([pkg]), {"breakfast"}, [pkg])
+        assert pkg / "core.py" in files
+        assert pkg / "__init__.py" in files
+        assert pkg / "unused.py" not in files
+
+    def test_nested_subpackage_walks_ancestors(self, tmp_path):
+        """A deep active file activates each ancestor __init__.py up to
+        the package root; namespace dirs (no __init__.py) are traversed
+        without error."""
+        pkg = tmp_path / "big"
+        (pkg / "sub").mkdir(parents=True)
+        (pkg / "nsdir").mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "sub" / "__init__.py").write_text("")
+        (pkg / "sub" / "deep.py").write_text("def f():\n    return 1\n")
+        (pkg / "nsdir" / "mod.py").write_text("def g():\n    return 2\n")
+
+        files = _active_files(index_dependency([pkg]), {"f", "g"}, [pkg])
+        assert pkg / "sub" / "deep.py" in files
+        assert pkg / "sub" / "__init__.py" in files
+        assert pkg / "__init__.py" in files
+        assert pkg / "nsdir" / "mod.py" in files
+
+    def test_single_file_module_dep(self, tmp_path):
+        """A single-file module dep has no package root to walk."""
+        mod = tmp_path / "flat.py"
+        mod.write_text("def f():\n    return 1\n")
+        files = _active_files(index_dependency([mod]), {"f"}, [mod])
+        assert files == [mod]
+
+    def test_same_stem_files_not_conflated(self, tmp_path):
+        """Same-named modules in different subpackages must not activate
+        each other — selection is by definition provenance, not module
+        name (regression: stem-keyed selection propagated phantom
+        imports from unrelated same-stem files)."""
+        pkg = tmp_path / "foo"
+        (pkg / "http").mkdir(parents=True)
+        (pkg / "db").mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "http" / "__init__.py").write_text("")
+        (pkg / "db" / "__init__.py").write_text("")
+        (pkg / "http" / "client.py").write_text("def get_client():\n    return 1\n")
+        (pkg / "db" / "client.py").write_text(
+            "import psycopg\n\ndef connect_db():\n    return psycopg.connect()\n"
+        )
+
+        files = _active_files(index_dependency([pkg]), {"get_client"}, [pkg])
+        assert pkg / "http" / "client.py" in files
+        assert pkg / "db" / "client.py" not in files
+
+    def test_no_used_names_yields_nothing(self, tmp_path):
+        mod = tmp_path / "flat.py"
+        mod.write_text("def f():\n    return 1\n")
+        assert _active_files(index_dependency([mod]), set(), [mod]) == []

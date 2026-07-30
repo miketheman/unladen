@@ -25,6 +25,14 @@ _RE_SEPARATOR = re.compile(r"[-_.]+")
 _RE_INLINE_COMMENT = re.compile(r"\s#")
 
 
+class DistributionNotFound(FileNotFoundError):
+    """No dist-info/egg-info for a distribution in site-packages.
+
+    Subclasses FileNotFoundError for backward compatibility, but lets
+    callers distinguish "not installed" from genuine filesystem errors.
+    """
+
+
 class DepInfo(TypedDict):
     """Metadata for a single declared dependency."""
 
@@ -241,7 +249,7 @@ def _parse_setup_py(setup_path: Path) -> list[str]:
     return []
 
 
-def _collect_list_variables(tree) -> dict[str, list[str]]:
+def _collect_list_variables(tree: ast.Module) -> dict[str, list[str]]:
     """Collect top-level variable assignments of string lists."""
 
     variables: dict[str, list[str]] = {}
@@ -256,7 +264,7 @@ def _collect_list_variables(tree) -> dict[str, list[str]]:
 
 
 def _resolve_setup_list_kwarg(
-    tree, kwarg_name: str, variables: dict[str, list[str]]
+    tree: ast.Module, kwarg_name: str, variables: dict[str, list[str]]
 ) -> list[str] | None:
     """Find a setup() keyword argument and resolve it to a string list."""
 
@@ -357,7 +365,7 @@ def _parse_requirements_txt(
     return deps
 
 
-def _extract_string_list(node) -> list[str] | None:
+def _extract_string_list(node: ast.List) -> list[str] | None:
     """Extract a list of constant strings from an ast.List node."""
 
     strings = []
@@ -398,6 +406,7 @@ def resolve_installed(
     dep_names: list[str],
     site_packages: Path,
     markers: dict[str, str] | None = None,
+    index: dict[str, Path] | None = None,
 ) -> dict[str, DepInfo]:
     """Resolve declared dependencies to their installed locations.
 
@@ -410,9 +419,13 @@ def resolve_installed(
     A marker-gated dep that is absent was most likely skipped by the
     installer because its marker is false in this environment, so the
     reporter shows it as "not applicable" rather than "not installed".
+
+    *index* is an optional pre-built dist-info index (from
+    ``_dist_info_index``) so callers resolving many packages against
+    the same site-packages don't re-list the directory each time.
     """
     result: dict[str, DepInfo] = {}
-    dist_infos = _dist_info_index(site_packages)
+    dist_infos = index if index is not None else _dist_info_index(site_packages)
     markers = markers or {}
 
     for dep_name in dep_names:
@@ -420,7 +433,7 @@ def resolve_installed(
             dist = importlib.metadata.Distribution.at(
                 _find_dist_info(dep_name, site_packages, dist_infos)
             )
-        except FileNotFoundError:
+        except DistributionNotFound:
             # Dependency declared but not installed
             dep_info: DepInfo = {
                 "version": None,
@@ -467,32 +480,54 @@ def resolve_package_info(
     return version, import_names, paths
 
 
+def package_requires(
+    package_name: str,
+    site_packages: Path,
+    index: dict[str, Path] | None = None,
+) -> list[str]:
+    """Read a package's Requires-Dist specs from its installed METADATA.
+
+    Skips extras-only deps (``; extra == "dev"``) since those are
+    optional and not activated by default installation.
+    Raises DistributionNotFound if the package has no dist-info.
+    """
+    dist = importlib.metadata.Distribution.at(
+        _find_dist_info(package_name, site_packages, index)
+    )
+    requires = dist.metadata.get_all("Requires-Dist") or []
+    # Skip extras-only deps: "foo ; extra == 'bar'"
+    return [req for req in requires if "extra ==" not in req and "extra==" not in req]
+
+
 def collect_package_deps(
     package_name: str,
     site_packages: Path,
+    index: dict[str, Path] | None = None,
+    info_cache: dict[str, DepInfo] | None = None,
 ) -> dict[str, DepInfo]:
     """Collect dependencies declared in a package's Requires-Dist metadata.
 
     Reads the installed package's METADATA to find its declared
     dependencies, then resolves them in site-packages.
-    Skips extras-only deps (``; extra == "dev"``) since those are
-    optional and not activated by default installation.
+    *index* is an optional pre-built dist-info index, passed through
+    to name resolution (see ``resolve_installed``).
+    *info_cache* is an optional cross-call memo of resolved DepInfos:
+    already-cached names skip metadata reads, and newly resolved ones
+    are added, so callers resolving many packages (transitive tracing)
+    read each distribution's metadata once.
     """
-    dist = importlib.metadata.Distribution.at(
-        _find_dist_info(package_name, site_packages)
-    )
-    requires = dist.metadata.get_all("Requires-Dist") or []
-    specs = []
-    for req in requires:
-        # Skip extras-only deps: "foo ; extra == 'bar'"
-        if "extra ==" in req or "extra==" in req:
-            continue
-        specs.append(req)
-
+    specs = package_requires(package_name, site_packages, index)
     if not specs:
         return {}
     dep_names, markers = _names_and_markers(specs)
-    return resolve_installed(dep_names, site_packages, markers=markers)
+    if info_cache is None:
+        return resolve_installed(dep_names, site_packages, markers=markers, index=index)
+    missing = [n for n in dep_names if n not in info_cache]
+    if missing:
+        info_cache.update(
+            resolve_installed(missing, site_packages, markers=markers, index=index)
+        )
+    return {n: info_cache[n] for n in dep_names}
 
 
 def _normalize_dep_name(dep_spec: str) -> str:
@@ -561,7 +596,7 @@ def _find_dist_info(
     try:
         return index[normalized]
     except KeyError:
-        raise FileNotFoundError(f"No dist-info found for {dep_name}") from None
+        raise DistributionNotFound(f"No dist-info found for {dep_name}") from None
 
 
 def _get_import_names(

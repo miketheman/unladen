@@ -87,6 +87,46 @@ These are currently invisible to the inspector.
 Detecting this pattern could improve
 heft accuracy for typing-heavy projects.
 
+### Transitive measurement: follow-ups
+
+`check --transitive` (experimental) ships with deliberate
+simplifications worth revisiting:
+
+- **Definition-level activation precision.**
+  Matching is by bare name end-to-end, so a used name activates
+  *every* same-named definition — `from foo.http import client`
+  also activates `foo/db/client.py` (and its imports) through the
+  module-name fallback.
+  The real fix is threading dotted context through the pipeline:
+  the inspector already sees `foo.http.client`, so used names could
+  carry their dotted module path, letting the tracer narrow
+  candidate definitions to files whose path matches before falling
+  back to bare-name resolution.
+  Touches inspector output, merger pass-through, and tracer entry
+  resolution; also improves main-report heft accuracy.
+- **Transitive usage into direct deps.**
+  Usage propagates *through* direct deps (their subtrees are
+  discovered, and re-propagated at the fixpoint), but the extra
+  activation still doesn't raise the direct dep's reported heft.
+  Showing "direct + transitive" heft per dep would give a truer
+  total-activation picture.
+- **Parse-once for import extraction.**
+  `inspect_source_files` re-parses a parent's *active* files to find
+  their imports after indexing already parsed them.
+  Extracting imports at index time was considered and rejected for
+  now: the usage walk would then run on *all* files (not just the
+  active subset) and bloat the worker payload, likely a net loss.
+- **Undeclared imports (ty-style classification).**
+  A prototype `classify_module` ordered imports ty-style
+  (first-party, declared third-party, stdlib via
+  `sys.stdlib_module_names`, else unknown) but was removed as dead
+  code: propagation only ever consults declared children's names.
+  Revive the idea where it has a consumer — classifying the imports
+  the inspector actually finds in active files, to flag missing
+  `Requires-Dist` entries (unknown) and backport shadowing (stdlib).
+- **Treemap integration.**
+  Transitive deps could render as nested tiles under their parent.
+
 ## CLI and UX
 
 ### `--include-tests` flag

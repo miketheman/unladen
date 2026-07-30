@@ -5,9 +5,11 @@ and measuring how much of it is activated by the project's imports.
 """
 
 import ast
+import atexit
 import os
 from concurrent.futures import InterpreterPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 from unladen._lloc import count_statements as _count_statements
 from unladen._lloc import is_type_checking_block as _is_type_checking_block
@@ -31,39 +33,17 @@ def compute_heft(
         A HeftResult with total/active LLOC and the heft ratio.
     """
     index = index_dependency(dep_paths)
-    return _heft_from_index(index, used_names, dep_name)
+    return heft_from_index(index, used_names, dep_name)
 
 
-def _heft_from_index(
-    index: DepIndex, used_names: set[str], dep_name: str
-) -> HeftResult:
-    """Compute HeftResult from a pre-built dependency index."""
-    total_lloc = index["total_lloc"]
+def heft_from_index(index: DepIndex, used_names: set[str], dep_name: str) -> HeftResult:
+    """Compute HeftResult from a pre-built dependency index.
 
-    if total_lloc == 0 or not used_names:
-        return HeftResult(
-            dep_name=dep_name,
-            total_lloc=total_lloc,
-            active_lloc=0,
-            heft_ratio=0.0,
-            opaque_files=index["opaque_files"],
-        )
-
-    call_graph = index["call_graph"]
-    ti = _TracerIndex(index["functions"])
-
-    matched = _trace_reachable(used_names, ti, call_graph)
-    active_lloc = _sum_active_lloc(matched, ti)
-
-    heft_ratio = active_lloc / total_lloc
-
-    return HeftResult(
-        dep_name=dep_name,
-        total_lloc=total_lloc,
-        active_lloc=active_lloc,
-        heft_ratio=heft_ratio,
-        opaque_files=index["opaque_files"],
-    )
+    Public so callers that already hold a DepIndex (e.g. transitive
+    tracing) can compute heft without re-indexing the source tree.
+    ``heft_from_trace`` owns the zero/empty result.
+    """
+    return heft_from_trace(index, trace_index(index, used_names), dep_name)
 
 
 def compute_hefts_bulk(
@@ -71,8 +51,8 @@ def compute_hefts_bulk(
 ) -> dict[str, HeftResult]:
     """Compute heft for multiple dependencies in parallel.
 
-    Collects source files from all deps concurrently (I/O-bound),
-    then indexes all files in a single process pool (CPU-bound).
+    Indexes all deps' files through one shared worker pool
+    (``index_dependencies_bulk``), then computes heft per dep.
 
     Args:
         work_items: List of (dep_name, dep_paths, used_names) tuples.
@@ -82,52 +62,12 @@ def compute_hefts_bulk(
     """
     if not work_items:
         return {}
-
-    # Phase A: collect source files from all deps
-    all_files: list[Path] = []
-    file_dep: list[str] = []
-    dep_opaque: dict[str, int] = {}
-    dep_used_names: dict[str, set[str]] = {}
-
-    for dep_name, dep_paths, used_names in work_items:
-        py_files, opaque_files = _collect_source_files(dep_paths)
-        dep_opaque[dep_name] = opaque_files
-        dep_used_names[dep_name] = used_names
-        for f in py_files:
-            all_files.append(f)
-            file_dep.append(dep_name)
-
-    # Phase B: index all files in a single pool (CPU-bound)
-    all_results = _index_files(all_files)
-
-    # Phase C: reassemble per-dep indexes
-    dep_indexes: dict[str, DepIndex] = {
-        dep_name: {
-            "total_lloc": 0,
-            "functions": [],
-            "opaque_files": dep_opaque[dep_name],
-            "call_graph": {},
-        }
-        for dep_name in dep_opaque
-    }
-
-    for i, result in enumerate(all_results):
-        if result is None:
-            continue
-        lloc, defs, calls = result
-        idx = dep_indexes[file_dep[i]]
-        idx["total_lloc"] += lloc
-        idx["functions"].extend(defs)
-        for name, callees in calls.items():
-            try:
-                idx["call_graph"][name].update(callees)
-            except KeyError:
-                idx["call_graph"][name] = callees
-
-    # Phase D: compute heft from each assembled index
+    indexes = index_dependencies_bulk(
+        [(dep_name, dep_paths) for dep_name, dep_paths, _ in work_items]
+    )
     return {
-        dep_name: _heft_from_index(idx, dep_used_names[dep_name], dep_name)
-        for dep_name, idx in dep_indexes.items()
+        dep_name: heft_from_index(indexes[dep_name], used_names, dep_name)
+        for dep_name, _, used_names in work_items
     }
 
 
@@ -279,6 +219,104 @@ def _sum_active_lloc(matched: set[str], ti: _TracerIndex) -> int:
     return total
 
 
+class TraceResult(NamedTuple):
+    """Result of one reachability BFS over a dependency index.
+
+    Produced by ``trace_index()`` and consumed by ``heft_from_trace()``
+    and ``files_from_trace()``, so a single BFS can serve both the heft
+    computation and the active-file selection.
+    """
+
+    ti: _TracerIndex
+    matched: set[str]
+
+
+def trace_index(
+    index: DepIndex,
+    used_names: set[str],
+    ti: _TracerIndex | None = None,
+) -> TraceResult:
+    """Run the reachability BFS from *used_names* over *index*.
+
+    *ti* optionally reuses the lookup tables from a previous trace of
+    the same index (they depend only on the index, not on used_names),
+    so re-tracing after a used-name growth skips their construction.
+    """
+    if ti is None:
+        ti = _TracerIndex(index["functions"])
+    matched = _trace_reachable(used_names, ti, index["call_graph"])
+    return TraceResult(ti, matched)
+
+
+def heft_from_trace(index: DepIndex, trace: TraceResult, dep_name: str) -> HeftResult:
+    """Compute HeftResult from an already-run trace.
+
+    Single owner of the zero result: an empty index or an empty
+    matched set yields active 0 / ratio 0.0.
+    """
+    total_lloc = index["total_lloc"]
+    if total_lloc == 0 or not trace.matched:
+        return HeftResult(
+            dep_name=dep_name,
+            total_lloc=total_lloc,
+            active_lloc=0,
+            heft_ratio=0.0,
+            opaque_files=index["opaque_files"],
+        )
+    active_lloc = _sum_active_lloc(trace.matched, trace.ti)
+    return HeftResult(
+        dep_name=dep_name,
+        total_lloc=total_lloc,
+        active_lloc=active_lloc,
+        heft_ratio=active_lloc / total_lloc,
+        opaque_files=index["opaque_files"],
+    )
+
+
+def files_from_trace(
+    index: DepIndex, trace: TraceResult, dep_paths: list[Path]
+) -> list[Path]:
+    """Return the source files containing definitions the trace reached.
+
+    Selection is by definition file provenance (``FuncDef["path"]``),
+    so two same-named modules in different subpackages don't activate
+    each other through module-stem keys.  (Matching is still by name:
+    two same-named *definitions* both match — an over-approximation
+    inherited from the name-based BFS; see FUTURE.md.)
+    Ancestor ``__init__.py`` files are included — importing anything
+    from a package executes every ``__init__`` on the way down.
+    *dep_paths* bounds the ancestor walk to the dependency's own roots,
+    and membership in the index's parsed-file list replaces
+    per-directory stat calls (every ancestor ``__init__.py`` of an
+    indexed file was itself collected).
+    """
+    matched = trace.matched
+    selected: set[Path] = set()
+    for func in index["functions"]:
+        if func["name"] in matched:
+            path = func.get("path")
+            if path is not None:
+                selected.add(path)
+    if not selected:
+        return []
+
+    indexed = set(index["files"])
+    # Paths are constructed verbatim under dep_paths, so plain lexical
+    # containment works — no resolve() needed.
+    roots = [p for p in dep_paths if p.is_dir()]
+    for f in list(selected):
+        root = next((r for r in roots if f.is_relative_to(r)), None)
+        if root is None:
+            continue
+        for d in f.parents:
+            init = d / "__init__.py"
+            if init in indexed:
+                selected.add(init)
+            if d == root:
+                break
+    return sorted(selected)
+
+
 def index_dependency(dep_paths: list[Path]) -> DepIndex:
     """Index a dependency's source code.
 
@@ -290,8 +328,56 @@ def index_dependency(dep_paths: list[Path]) -> DepIndex:
     """
     py_files, opaque_files = _collect_source_files(dep_paths)
     file_results = _index_files(py_files)
-    idx = _assemble_index(file_results, opaque_files)
-    return idx
+    return _assemble_index(file_results, opaque_files, py_files)
+
+
+def index_dependencies_bulk(
+    items: list[tuple[str, list[Path]]],
+) -> dict[str, DepIndex]:
+    """Index multiple dependencies through one shared worker pool.
+
+    Flattens all files into a single ``_index_files`` call so many
+    small dependencies batch past the parallelism threshold together
+    instead of each being indexed serially (or paying its own pool
+    startup).
+    """
+    if not items:
+        return {}
+
+    # Coalesce duplicate dep names first: accumulating files under one
+    # name while overwriting its file list would misalign the zip in
+    # _assemble_index and corrupt provenance.
+    merged_paths: dict[str, list[Path]] = {}
+    for dep_name, dep_paths in items:
+        existing = merged_paths.setdefault(dep_name, [])
+        for p in dep_paths:
+            if p not in existing:
+                existing.append(p)
+
+    all_files: list[Path] = []
+    file_dep: list[str] = []
+    dep_files: dict[str, list[Path]] = {}
+    dep_opaque: dict[str, int] = {}
+    for dep_name, dep_paths in merged_paths.items():
+        py_files, opaque_files = _collect_source_files(dep_paths)
+        dep_files[dep_name] = py_files
+        dep_opaque[dep_name] = opaque_files
+        for f in py_files:
+            all_files.append(f)
+            file_dep.append(dep_name)
+
+    all_results = _index_files(all_files)
+
+    # Regroup per dep; order within each dep matches dep_files[dep]
+    # because all_files was flattened dep by dep.
+    dep_results: dict[str, list[_FileIndex | None]] = {name: [] for name in dep_opaque}
+    for i, result in enumerate(all_results):
+        dep_results[file_dep[i]].append(result)
+
+    return {
+        name: _assemble_index(dep_results[name], dep_opaque[name], dep_files[name])
+        for name in dep_opaque
+    }
 
 
 # Minimum file count to justify subinterpreter startup overhead.
@@ -299,10 +385,15 @@ def index_dependency(dep_paths: list[Path]) -> DepIndex:
 # takes ~5ms serially vs ~15ms with pool startup on a typical machine.
 _PARALLEL_THRESHOLD = 100
 
+# Per-file indexing result: (lloc, defs, calls).  File provenance is
+# attached during assembly, not here, to keep the payload pickled back
+# from subinterpreter workers small.
+_FileIndex = tuple[int, list[FuncDef], dict[str, set[str]]]
+
 
 def _index_files(
     py_files: list[Path],
-) -> list[tuple[int, list[FuncDef], dict[str, set[str]]] | None]:
+) -> list[_FileIndex | None]:
     """Index files serially or in parallel based on count."""
     if len(py_files) >= _PARALLEL_THRESHOLD:
         return _index_files_parallel(py_files)
@@ -310,18 +401,31 @@ def _index_files(
 
 
 def _assemble_index(
-    file_results: list[tuple[int, list[FuncDef], dict[str, set[str]]] | None],
-    opaque_files: int = 0,
+    file_results: list[_FileIndex | None],
+    opaque_files: int,
+    py_files: list[Path],
 ) -> DepIndex:
-    """Assemble a DepIndex from per-file indexing results."""
+    """Assemble a DepIndex from per-file indexing results.
+
+    *py_files* is aligned with *file_results*; each definition is
+    annotated with its source file here (parent-side, after any worker
+    round-trip) so activation can be resolved to exact files.
+    """
     total_lloc = 0
     functions: list[FuncDef] = []
     call_graph: dict[str, set[str]] = {}
-    for result in file_results:
+    parsed_files: list[Path] = []
+    for result, path in zip(file_results, py_files):
         if result is None:
+            # Unparseable file: keep it out of "files" so consumers
+            # (ancestor-__init__ selection) never treat it as usable
+            # and later re-parse it just to warn.
             continue
         lloc, defs, calls = result
         total_lloc += lloc
+        parsed_files.append(path)
+        for d in defs:
+            d["path"] = path
         functions.extend(defs)
         for name, callees in calls.items():
             try:
@@ -333,12 +437,11 @@ def _assemble_index(
         "functions": functions,
         "opaque_files": opaque_files,
         "call_graph": call_graph,
+        "files": parsed_files,
     }
 
 
-def _index_single_file(
-    py_file: Path,
-) -> tuple[int, list[FuncDef], dict[str, set[str]]] | None:
+def _index_single_file(py_file: Path) -> _FileIndex | None:
     """Parse, count LLOC, extract defs and calls from one file."""
     tree = _parse_file(py_file)
     if tree is None:
@@ -353,19 +456,34 @@ def _index_single_file(
     return lloc, defs, calls
 
 
+# Shared worker pool, created lazily on first parallel batch and
+# reused for the rest of the process (shut down at exit).  A transitive
+# run indexes one batch per BFS level; re-creating subinterpreters for
+# each batch would pay the pool startup cost every level.
+_WORKER_POOL: InterpreterPoolExecutor | None = None
+_POOL_WORKERS = min(os.cpu_count() or 1, 6)
+
+
+def _get_worker_pool() -> InterpreterPoolExecutor:
+    global _WORKER_POOL
+    if _WORKER_POOL is None:
+        _WORKER_POOL = InterpreterPoolExecutor(max_workers=_POOL_WORKERS)
+        atexit.register(_WORKER_POOL.shutdown)
+    return _WORKER_POOL
+
+
 def _index_files_parallel(
     py_files: list[Path],
-) -> list[tuple[int, list[FuncDef], dict[str, set[str]]] | None]:
+) -> list[_FileIndex | None]:
     """Index files using parallel interpreter workers.
 
     Uses InterpreterPoolExecutor (Python 3.14+) for true parallelism.
     Capped at 6 workers to avoid diminishing returns from context
     switching.  Chunksize tuned to ~4 batches per worker.
     """
-    workers = min(os.cpu_count() or 1, 6)
-    chunksize = max(1, len(py_files) // (workers * 4))
-    with InterpreterPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(_index_single_file, py_files, chunksize=chunksize))
+    chunksize = max(1, len(py_files) // (_POOL_WORKERS * 4))
+    pool = _get_worker_pool()
+    return list(pool.map(_index_single_file, py_files, chunksize=chunksize))
 
 
 _OPAQUE_SUFFIXES = frozenset((".so", ".pyd", ".dylib"))
